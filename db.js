@@ -20,6 +20,15 @@ import mysql from 'mysql2/promise';
 
 let pool = null;
 
+// People paste "host:port" — it is how connection details are always written
+// down. Split it rather than failing with an unreadable DNS error.
+function hostAndPort() {
+  const raw = String(process.env.SQL_SERVER || '').trim().replace(/^\w+:\/\//, '');
+  const m = /^(.+?):(\d+)$/.exec(raw);
+  if (m) return { host: m[1], port: Number(m[2]) };
+  return { host: raw, port: Number(process.env.SQL_PORT || 3306) };
+}
+
 export function sqlConfigured() {
   return Boolean(process.env.SQL_SERVER && process.env.SQL_DATABASE && process.env.SQL_USER);
 }
@@ -28,9 +37,10 @@ export function getPool() {
   if (!sqlConfigured()) throw new Error('MySQL is not configured — set SQL_SERVER, SQL_DATABASE, SQL_USER, SQL_PASSWORD.');
   if (pool) return pool;
 
+  const { host, port } = hostAndPort();
   pool = mysql.createPool({
-    host: process.env.SQL_SERVER,
-    port: Number(process.env.SQL_PORT || 3306),
+    host,
+    port,
     database: process.env.SQL_DATABASE,
     user: process.env.SQL_USER,
     password: process.env.SQL_PASSWORD,
@@ -48,7 +58,7 @@ export function getPool() {
     timezone: 'Z',
   });
 
-  console.log('[db] pool ready for', process.env.SQL_SERVER, '/', process.env.SQL_DATABASE);
+  console.log('[db] pool ready for', `${host}:${port}`, '/', process.env.SQL_DATABASE);
   return pool;
 }
 
