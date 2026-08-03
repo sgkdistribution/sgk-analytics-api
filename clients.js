@@ -19,7 +19,9 @@
 // they invite to the portal works without another config change.
 //
 // SGK staff are matched by SGK_DOMAINS / SGK_EMAILS (or a Cognito group named in
-// SGK_GROUP) and may read any company by passing ?company=<companyId>.
+// SGK_GROUP) and may read any company by passing ?company=<companyId>. Staff
+// requests also match on the company NAME, so companyId can be anything you like
+// — you never have to go digging in DynamoDB for the portal's internal id.
 //
 // WHY NOT STORE THE KEY ON THE COMPANY RECORD IN THE PORTAL, so it can be typed
 // into the SGK admin screen? Because whatever the browser can set, the browser
@@ -69,14 +71,27 @@ export function isSgk({ email, groups }) {
     || parseList(process.env.SGK_DOMAINS || 'sgkhomedelivery.co.uk').includes(domain);
 }
 
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
 // The ONLY way a company is chosen. Clients get theirs; SGK may ask for one.
-export function resolveCompany(identity, requestedCompanyId) {
+export function resolveCompany(identity, requested = {}) {
   const map = clientMap();
+  const { companyId, companyName } = requested;
 
   if (isSgk(identity)) {
-    if (!requestedCompanyId) return { staff: true, company: null };
-    const hit = map.find((c) => c.companyId === String(requestedCompanyId));
-    if (!hit) throw Object.assign(new Error(`No analytics key configured for "${requestedCompanyId}"`), { status: 404 });
+    if (!companyId && !companyName) return { staff: true, company: null };
+    // Match on the portal's id if it happens to be in the map, otherwise on the
+    // company NAME — which is why nobody needs to look up a DynamoDB id.
+    const hit = map.find((c) => c.companyId === String(companyId || ''))
+      || (companyName ? map.find((c) => norm(c.name) === norm(companyName)) : null)
+      || (companyName ? map.find((c) => norm(c.companyId) === norm(companyName)) : null);
+    if (!hit) {
+      const known = map.map((c) => c.name).join(', ') || '(CLIENT_MAP is empty)';
+      throw Object.assign(
+        new Error(`No analytics key configured for "${companyName || companyId}". Configured: ${known}`),
+        { status: 404 },
+      );
+    }
     return { staff: true, company: hit };
   }
 
@@ -84,10 +99,40 @@ export function resolveCompany(identity, requestedCompanyId) {
   const domain = identity.email.split('@')[1] || '';
   const hit = map.find((c) => c.emails.includes(identity.email))
     || map.find((c) => c.domains.includes(domain));
-  if (!hit) throw Object.assign(new Error('No dashboard is configured for this account yet.'), { status: 403 });
+  if (!hit) {
+    throw Object.assign(
+      new Error(`No dashboard is configured for this account yet — nothing in CLIENT_MAP covers "${domain}". Add that domain to the right company.`),
+      { status: 403 },
+    );
+  }
   return { staff: false, company: hit };
 }
 
 export function listCompanies() {
   return clientMap().map((c) => ({ companyId: c.companyId, name: c.name }));
+}
+
+// For /analytics/whoami — what the server sees, so a misconfigured map can be
+// diagnosed in one look instead of guessed at.
+export function describeAccess(identity) {
+  const staff = isSgk(identity);
+  const domain = identity.email.split('@')[1] || '';
+  const map = clientMap();
+  const match = map.find((c) => c.emails.includes(identity.email))
+    || map.find((c) => c.domains.includes(domain));
+  return {
+    email: identity.email,
+    domain,
+    treatedAs: staff ? 'SGK staff' : 'client',
+    matched: match ? { companyId: match.companyId, name: match.name, sqlKey: match.sqlKey } : null,
+    // Staff see the whole map; a client only ever sees their own entry.
+    configured: staff
+      ? map.map((c) => ({ companyId: c.companyId, name: c.name, domains: c.domains, sqlKey: c.sqlKey }))
+      : undefined,
+    hint: match
+      ? 'This account resolves correctly.'
+      : staff
+        ? 'Staff account — pass ?company= to pick a client.'
+        : `No CLIENT_MAP entry lists "${domain}" under domains, and no entry lists this exact email. Add "${domain}" to the right company's domains.`,
+  };
 }

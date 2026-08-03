@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 import express from 'express';
 import { verifyToken, authConfigured } from './auth.js';
-import { resolveCompany, listCompanies, isSgk } from './clients.js';
+import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.js';
 import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
 
@@ -62,6 +62,18 @@ app.get('/health', async (_req, res) => {
   res.json({ ok: true, db, auth: authConfigured() ? 'configured' : 'not configured', clients: listCompanies().length });
 });
 
+// DIAGNOSTIC. Answers "who does the server think I am, and why did my lookup
+// fail" — so a misconfigured CLIENT_MAP takes one look instead of guesswork.
+// Requires a valid token, and a client only ever sees their own entry.
+app.get('/analytics/whoami', async (req, res) => {
+  try {
+    const identity = await verifyToken(req.headers.authorization);
+    res.json(describeAccess(identity));
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
 // Which companies SGK staff may switch between (the ones with a key configured).
 app.get('/analytics/companies', async (req, res) => {
   try {
@@ -78,7 +90,7 @@ app.get('/analytics/overview', async (req, res) => {
     if (!sqlConfigured()) return res.status(503).json({ error: 'The analytics database is not connected yet.' });
 
     const identity = await verifyToken(req.headers.authorization);
-    const { staff, company } = resolveCompany(identity, req.query.company);
+    const { staff, company } = resolveCompany(identity, { companyId: req.query.company, companyName: req.query.companyName });
     if (!company) {
       // SGK staff with no company chosen — tell them what they can pick.
       return res.json({ needsCompany: true, companies: listCompanies() });
