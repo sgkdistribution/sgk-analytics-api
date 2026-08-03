@@ -1,13 +1,13 @@
 # SGK Analytics API
 
-Live figures from the Go2Stream WMS SQL Server, served to the portal dashboards.
+Live figures from the Go2Stream WMS extract (MySQL), served to the portal dashboards.
 Read-only. One endpoint. Per-company isolation enforced on the server.
 
 ## What it is for
 
-The dashboards used to be Power BI reports pointed at SQL Server. This service
-replaces the middle of that: the portal asks it for a company's numbers, it
-queries SQL Server, and it returns JSON the portal draws itself.
+The dashboards used to be Power BI reports pointed at the WMS database. This
+service replaces the middle of that: the portal asks it for a company's numbers,
+it queries MySQL, and it returns JSON the portal draws itself.
 
 ## Endpoints
 
@@ -39,9 +39,9 @@ Three things, in order, on every single request:
 1. `npm install`
 2. Copy `.env.example` to `.env` and fill it in — **or set the same variables in
    Railway, which is where the real ones belong.** Never commit them.
-3. Create a dedicated SQL login for this service and grant it `db_datareader`
-   and nothing else. It has no reason to be able to write, so it should not be
-   able to.
+3. Create a dedicated MySQL user for this service and grant it `SELECT` on this
+   one database and nothing else. It has no reason to be able to write, so it
+   should not be able to.
 4. `npm run discover` — prints the tables, columns and status values it can see.
    No order data, no customers, no prices, no password. Send that output on and
    the SQL mapping in `queries.js` gets finished against your real schema.
@@ -52,7 +52,7 @@ Three things, in order, on every single request:
     server.js     HTTP, caching, the response the portal consumes
     auth.js       Cognito token verification
     clients.js    email -> company -> WMS key (the isolation map)
-    db.js         the read-only SQL Server pool
+    db.js         the read-only MySQL pool
     queries.js    THE ONLY FILE THAT KNOWS YOUR SCHEMA — edit this one
     discover.js   prints your schema so queries.js can be finished
 

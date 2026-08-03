@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
-// SGK ANALYTICS API — live figures from the Go2Stream WMS SQL Server, served to
-// the portal dashboards.
+// SGK ANALYTICS API — live figures from the Go2Stream WMS extract (MySQL),
+// served to the portal dashboards.
 //
 // One endpoint does the whole dashboard:
 //   GET /analytics/overview?year=&month=&from=&to=&service=[&company=]
@@ -14,7 +14,7 @@
 import express from 'express';
 import { verifyToken, authConfigured } from './auth.js';
 import { resolveCompany, listCompanies, isSgk } from './clients.js';
-import { sqlConfigured, getPool } from './db.js';
+import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
 
 const app = express();
@@ -57,7 +57,7 @@ const ddMon = (d) => `${String(d.getUTCDate()).padStart(2, '0')} ${MONTHS[d.getU
 app.get('/health', async (_req, res) => {
   let db = 'not configured';
   if (sqlConfigured()) {
-    try { await getPool(); db = 'connected'; } catch (e) { db = `error: ${e?.message || e}`; }
+    try { await ping(); db = 'connected'; } catch (e) { db = `error: ${e?.message || e}`; }
   }
   res.json({ ok: true, db, auth: authConfigured() ? 'configured' : 'not configured', clients: listCompanies().length });
 });
@@ -177,5 +177,5 @@ app.listen(PORT, () => {
   console.log(`[analytics] listening on ${PORT}`);
   console.log(`[analytics] origins: ${ORIGINS.join(', ')}`);
   if (!authConfigured()) console.warn('[analytics] COGNITO_USER_POOL_ID is not set — every request will be rejected.');
-  if (!sqlConfigured()) console.warn('[analytics] SQL Server is not configured — /analytics/overview will return 503.');
+  if (!sqlConfigured()) console.warn('[analytics] MySQL is not configured — /analytics/overview will return 503.');
 });

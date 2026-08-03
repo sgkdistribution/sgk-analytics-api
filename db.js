@@ -1,66 +1,71 @@
 // ---------------------------------------------------------------------------
-// SQL SERVER — one shared, read-only pool.
+// MySQL — one shared, read-only pool.
 //
-// The WMS database is a production system that the warehouse depends on. This
-// service is a guest in it and behaves like one:
+// (This service was first written against SQL Server. The database turned out
+// to be MySQL on 3306, so the driver and the dialect are MySQL throughout. The
+// environment variable NAMES were deliberately left alone — SQL_SERVER,
+// SQL_DATABASE and the whole SQL_ORDERS_* / SQL_ATTEMPTS_* mapping — so nothing
+// already set on Railway has to be typed again.)
+//
+// The extract database is something the business depends on. This service is a
+// guest in it and behaves like one:
 //   * ONE pool, reused. Never a connection per request.
-//   * READ ONLY. There is no insert/update/delete path anywhere in this repo,
-//     and the SQL login it uses should be granted db_datareader and nothing
-//     more. If someone ever finds a way to inject, the worst they can do is
-//     read — and even that is fenced by the company filter.
+//   * READ ONLY. There is no insert/update/delete anywhere in this repo, and
+//     the MySQL user should be granted SELECT and nothing more.
 //   * Every value is a bound PARAMETER. Nothing from a browser is ever
-//     concatenated into a query string.
-//   * Statement timeout, so a heavy query can never pin a WMS connection.
+//     concatenated into a query.
+//   * Statement timeout, so one heavy query cannot pin a connection.
 // ---------------------------------------------------------------------------
-import sql from 'mssql';
+import mysql from 'mysql2/promise';
 
-let poolPromise = null;
+let pool = null;
 
 export function sqlConfigured() {
   return Boolean(process.env.SQL_SERVER && process.env.SQL_DATABASE && process.env.SQL_USER);
 }
 
-export async function getPool() {
-  if (!sqlConfigured()) throw new Error('SQL Server is not configured — set SQL_SERVER, SQL_DATABASE, SQL_USER, SQL_PASSWORD.');
-  if (poolPromise) return poolPromise;
+export function getPool() {
+  if (!sqlConfigured()) throw new Error('MySQL is not configured — set SQL_SERVER, SQL_DATABASE, SQL_USER, SQL_PASSWORD.');
+  if (pool) return pool;
 
-  const config = {
-    server: process.env.SQL_SERVER,
+  pool = mysql.createPool({
+    host: process.env.SQL_SERVER,
+    port: Number(process.env.SQL_PORT || 3306),
     database: process.env.SQL_DATABASE,
     user: process.env.SQL_USER,
     password: process.env.SQL_PASSWORD,
-    port: Number(process.env.SQL_PORT || 1433),
-    options: {
-      encrypt: process.env.SQL_ENCRYPT !== 'false',            // Azure SQL needs this on
-      trustServerCertificate: process.env.SQL_TRUST_CERT === 'true',
-      enableArithAbort: true,
-    },
-    pool: { max: Number(process.env.SQL_POOL_MAX || 6), min: 0, idleTimeoutMillis: 30000 },
-    requestTimeout: Number(process.env.SQL_TIMEOUT_MS || 20000),
-    connectionTimeout: 15000,
-  };
+    // The connection crosses the public internet, so encrypt it. Set
+    // SQL_ENCRYPT=false only if the server genuinely does not offer TLS.
+    ssl: process.env.SQL_ENCRYPT === 'false'
+      ? undefined
+      : { rejectUnauthorized: process.env.SQL_TRUST_CERT !== 'true' },
+    connectionLimit: Number(process.env.SQL_POOL_MAX || 6),
+    waitForConnections: true,
+    connectTimeout: 15000,
+    namedPlaceholders: true,        // lets queries use :name instead of ?
+    dateStrings: false,
+    decimalNumbers: true,
+    timezone: 'Z',
+  });
 
-  poolPromise = new sql.ConnectionPool(config).connect()
-    .then((pool) => {
-      console.log('[db] connected to', config.server, '/', config.database);
-      pool.on('error', (e) => { console.error('[db] pool error:', e?.message || e); poolPromise = null; });
-      return pool;
-    })
-    .catch((e) => {
-      poolPromise = null;                                       // let the next request retry
-      throw e;
-    });
-
-  return poolPromise;
+  console.log('[db] pool ready for', process.env.SQL_SERVER, '/', process.env.SQL_DATABASE);
+  return pool;
 }
 
-// Run a parameterised read. params is a plain object: { year: 2026, key: 'RSL' }.
+// Run a parameterised read. params is a plain object: { year: 2026, clientKey: 'RSL' }.
 export async function query(text, params = {}) {
-  const pool = await getPool();
-  const req = pool.request();
-  for (const [name, value] of Object.entries(params)) req.input(name, value);
-  const result = await req.query(text);
-  return result.recordset || [];
+  const conn = await getPool().getConnection();
+  try {
+    await conn.query({ sql: `SET SESSION MAX_EXECUTION_TIME=${Number(process.env.SQL_TIMEOUT_MS || 20000)}` }).catch(() => {});
+    const [rows] = await conn.query({ sql: text, timeout: Number(process.env.SQL_TIMEOUT_MS || 20000) }, params);
+    return Array.isArray(rows) ? rows : [];
+  } finally {
+    conn.release();
+  }
 }
 
-export { sql };
+// Cheap liveness check for /health.
+export async function ping() {
+  const rows = await query('SELECT 1 AS ok');
+  return rows.length > 0;
+}
