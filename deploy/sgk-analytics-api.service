@@ -1,0 +1,27 @@
+[Unit]
+Description=SGK Analytics API (read-only WMS figures for the portal dashboards)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/sgk-analytics-api
+# Secrets live in one root-owned file, never in the repo and never in the unit.
+EnvironmentFile=/etc/sgk-analytics.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# The service reads a database and answers HTTP. It has no business doing
+# anything else, so lock the rest down.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sgk-analytics-api
+
+[Install]
+WantedBy=multi-user.target
