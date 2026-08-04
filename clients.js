@@ -8,7 +8,10 @@
 //   {
 //     "companyId": "roseland",              // must match the portal's company id
 //     "name":      "Roseland Furniture",
-//     "sqlKey":    "RSL",                   // the value the WMS uses for this client
+//     "sqlKey":    "ROSELAND FURNITURE",     // the PartnerName in the WMS.
+//                                            // Can also be a LIST if a client
+//                                            // has more than one partner code:
+//                                            // ["ROSELAND FURNITURE","Roseland Service Call"]
 //     "domains":   ["roselandfurniture.co.uk"],
 //     "emails":    ["michael.broom@roselandfurniture.co.uk"]
 //   }
@@ -56,7 +59,8 @@ export function clientMap() {
     .map((c) => ({
       companyId: String(c.companyId),
       name: String(c.name || c.companyId),
-      sqlKey: String(c.sqlKey),
+      // One company can own several PartnerName values in the WMS.
+      sqlKey: Array.isArray(c.sqlKey) ? c.sqlKey.map(String) : [String(c.sqlKey)],
       domains: (c.domains || []).map((d) => String(d).toLowerCase().replace(/^@/, '')),
       emails: (c.emails || []).map((e) => String(e).toLowerCase()),
     }));

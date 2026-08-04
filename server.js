@@ -74,6 +74,19 @@ app.get('/analytics/whoami', async (req, res) => {
   }
 });
 
+// Every PartnerName in the extract — SGK staff only. This is where the sqlKey
+// values for CLIENT_MAP come from, so nobody has to run a query by hand.
+app.get('/analytics/partners', async (req, res) => {
+  try {
+    const identity = await verifyToken(req.headers.authorization);
+    if (!isSgk(identity)) return res.status(403).json({ error: 'SGK staff only.' });
+    if (!sqlConfigured()) return res.status(503).json({ error: 'The analytics database is not connected yet.' });
+    res.json({ partners: await Q.partnerNames() });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
 // Which companies SGK staff may switch between (the ones with a key configured).
 app.get('/analytics/companies', async (req, res) => {
   try {

@@ -1,20 +1,20 @@
 // ---------------------------------------------------------------------------
-// THE ONLY FILE THAT KNOWS YOUR DATABASE.
+// THE ONLY FILE THAT KNOWS THE DATABASE — now written against the REAL schema
+// of stream_data_extract_sgk, not guesses.
 //
-// Everything else — auth, isolation, caching, the HTTP contract the portal
-// talks to — is finished and does not change when the real table and column
-// names land. All of it sits behind this one file.
+// What we learned from the extract:
+//   orders  one row per order.  Client = PartnerName.  Money = OrderCharges.
+//           Status is carried as FLAGS (OrderStatusCompleteFlag) rather than
+//           strings, which is better — no worrying about spelling or casing.
+//   stops   one row per visit to a customer. This is a delivery ATTEMPT.
+//           Linked to an order by OrderID, dated by RunDate, and again all the
+//           outcomes are flags: StopStatusCompleteFlag, StopStatusFailedFlag,
+//           StopTimeOnTimeFlag.
+//   drops   finer-grained than stops (splits collection from delivery). Not
+//           used here — stops is the right grain for "attempts".
 //
-// MySQL dialect (the database is MySQL on 3306, not SQL Server). The names in
-// SCHEMA below are still PLACEHOLDERS, guessed from the labels on the old Power
-// BI report. Run `npm run discover` and either correct them here or override any
-// one of them with an env var — every key reads from env first, so a wrong guess
-// is fixable on Railway without a deploy.
-//
-// SAFETY NOTE ON IDENTIFIERS: table and column names cannot be bound as query
-// parameters, so they are interpolated. That is exactly why they come from
-// server config and never from a request — and why each one goes through
-// ident(), which refuses anything that is not a plain name.
+// Every name below can still be overridden by an env var, but the defaults are
+// now the actual column names, so nothing needs setting for it to work.
 // ---------------------------------------------------------------------------
 import { query } from './db.js';
 
@@ -29,51 +29,64 @@ function ident(name) {
 }
 
 export const SCHEMA = {
-  // --- orders -------------------------------------------------------------
-  orders:            env('SQL_ORDERS_TABLE', 'orders'),
-  o_client:          env('SQL_ORDERS_CLIENT_COL', 'ClientCode'),      // the per-client key
-  o_id:              env('SQL_ORDERS_ID_COL', 'OrderId'),
-  o_value:           env('SQL_ORDERS_VALUE_COL', 'OrderValue'),
-  o_weight:          env('SQL_ORDERS_WEIGHT_COL', 'WeightKg'),
-  o_cube:            env('SQL_ORDERS_CUBE_COL', 'CubeM3'),
-  o_items:           env('SQL_ORDERS_ITEMS_COL', 'ItemCount'),
-  o_service:         env('SQL_ORDERS_SERVICE_COL', 'ServiceLevelName'),
-  o_status:          env('SQL_ORDERS_STATUS_COL', 'OrderStatus'),
-  o_completedValue:  env('SQL_ORDERS_COMPLETED_VALUE', 'Completed'),
-  o_created:         env('SQL_ORDERS_CREATED_COL', 'CreatedDate'),
-  o_received:        env('SQL_ORDERS_RECEIVED_COL', 'ReceivedDate'),
-  o_proposed:        env('SQL_ORDERS_PROPOSED_COL', 'ProposedDate'),
-  o_delivered:       env('SQL_ORDERS_DELIVERED_COL', 'DeliveredDate'),
+  orders:        env('SQL_ORDERS_TABLE', 'orders'),
+  o_client:      env('SQL_ORDERS_CLIENT_COL', 'PartnerName'),
+  o_id:          env('SQL_ORDERS_ID_COL', 'OrderID'),
+  o_value:       env('SQL_ORDERS_VALUE_COL', 'OrderCharges'),      // what the client is charged
+  o_weight:      env('SQL_ORDERS_WEIGHT_COL', 'OrderWeight'),
+  o_cube:        env('SQL_ORDERS_CUBE_COL', 'OrderCube'),
+  o_items:       env('SQL_ORDERS_ITEMS_COL', 'OrderItemsCount'),
+  o_service:     env('SQL_ORDERS_SERVICE_COL', 'ServiceLevelName'),
+  o_completeFlag: env('SQL_ORDERS_COMPLETE_FLAG', 'OrderStatusCompleteFlag'),
+  o_date:        env('SQL_ORDERS_DATE_COL', 'OrderDate'),
+  o_statusName:  env('SQL_ORDERS_STATUS_COL', 'OrderStatusName'),
+  // The three durations the WMS has already worked out for us, in days.
+  o_confToBook:  env('SQL_ORDERS_CONF_TO_BOOK', 'OrderTimeConfToBook'),
+  o_bookToDone:  env('SQL_ORDERS_BOOK_TO_DONE', 'OrderTimeBookToCompleted'),
+  o_confToDone:  env('SQL_ORDERS_CONF_TO_DONE', 'OrderTimeConfToCompleted'),
 
-  // --- delivery attempts --------------------------------------------------
-  attempts:          env('SQL_ATTEMPTS_TABLE', 'delivery_attempts'),
-  a_client:          env('SQL_ATTEMPTS_CLIENT_COL', 'ClientCode'),
-  a_order:           env('SQL_ATTEMPTS_ORDER_COL', 'OrderId'),
-  a_date:            env('SQL_ATTEMPTS_DATE_COL', 'AttemptDate'),
-  a_status:          env('SQL_ATTEMPTS_STATUS_COL', 'AttemptStatus'),
-  a_successValue:    env('SQL_ATTEMPTS_SUCCESS_VALUE', 'Successful'),
-  a_failValue:       env('SQL_ATTEMPTS_FAIL_VALUE', 'Failed'),
-  a_onTimeCol:       env('SQL_ATTEMPTS_ONTIME_COL', 'OnTimeStatus'),
-  a_onTimeValue:     env('SQL_ATTEMPTS_ONTIME_VALUE', 'On Time'),
+  attempts:      env('SQL_ATTEMPTS_TABLE', 'stops'),
+  a_client:      env('SQL_ATTEMPTS_CLIENT_COL', 'PartnerName'),
+  a_order:       env('SQL_ATTEMPTS_ORDER_COL', 'OrderID'),
+  a_date:        env('SQL_ATTEMPTS_DATE_COL', 'RunDate'),
+  a_okFlag:      env('SQL_ATTEMPTS_OK_FLAG', 'StopStatusCompleteFlag'),
+  a_failFlag:    env('SQL_ATTEMPTS_FAIL_FLAG', 'StopStatusFailedFlag'),
+  a_onTimeFlag:  env('SQL_ATTEMPTS_ONTIME_FLAG', 'StopTimeOnTimeFlag'),
 };
 
-// The date every figure is measured against: the delivered date where it is
-// known, the created date otherwise, so a month never loses the orders that
-// have not landed yet.
-const orderDate = (alias = '') => {
+const oDate = (alias = '') => `${alias ? alias + '.' : ''}${ident(SCHEMA.o_date)}`;
+
+// ---------------------------------------------------------------------------
+// FILTERS — the client key is never optional and a caller cannot drop it.
+// ---------------------------------------------------------------------------
+// A company can own several PartnerName values, so the key is always a list.
+function clientKeys(f) {
+  const keys = Array.isArray(f.clientKey) ? f.clientKey : [f.clientKey];
+  const names = keys.map((_, i) => `:ck${i}`);
+  const params = {};
+  keys.forEach((k, i) => { params[`ck${i}`] = k; });
+  return { placeholders: names.join(', '), params };
+}
+
+// Cancelled orders are not revenue and were never delivered, so they are left
+// out of every figure. Set SQL_ORDERS_EXCLUDE_STATUSES to '' to include them,
+// or add more comma-separated statuses to exclude.
+const EXCLUDED = String(process.env.SQL_ORDERS_EXCLUDE_STATUSES ?? 'Cancelled')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+
+function excludeClause(alias, params) {
+  if (!EXCLUDED.length) return '';
   const p = alias ? `${alias}.` : '';
-  return `COALESCE(${p}${ident(SCHEMA.o_delivered)}, ${p}${ident(SCHEMA.o_created)})`;
-};
+  EXCLUDED.forEach((v, i) => { params[`ex${i}`] = v; });
+  return ` AND ${p}${ident(SCHEMA.o_statusName)} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')})`;
+}
 
-// ---------------------------------------------------------------------------
-// FILTERS. Note the shape: the company key is not optional and cannot be
-// dropped by a caller — the WHERE clause always starts with it.
-// ---------------------------------------------------------------------------
 function orderFilter(f, alias = '') {
   const p = alias ? `${alias}.` : '';
-  const d = orderDate(alias);
-  const conds = [`${p}${ident(SCHEMA.o_client)} = :clientKey`];
-  const params = { clientKey: f.clientKey };
+  const d = oDate(alias);
+  const ck = clientKeys(f);
+  const conds = [`${p}${ident(SCHEMA.o_client)} IN (${ck.placeholders})`];
+  const params = { ...ck.params };
 
   if (f.year)  { conds.push(`YEAR(${d}) = :year`);   params.year = Number(f.year); }
   if (f.month) { conds.push(`MONTH(${d}) = :month`); params.month = Number(f.month); }
@@ -81,28 +94,23 @@ function orderFilter(f, alias = '') {
   if (f.to)    { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
   if (f.service) { conds.push(`${p}${ident(SCHEMA.o_service)} = :service`); params.service = String(f.service); }
 
-  return { where: `WHERE ${conds.join(' AND ')}`, params, date: d };
+  return { where: `WHERE ${conds.join(' AND ')}${excludeClause(alias, params)}`, params, date: d };
 }
 
-// Attempts carry no service level of their own, so that filter joins back to
-// the order the attempt belongs to.
+// stops carry their own PartnerName and ServiceLevelName, so no join is needed.
 function attemptFilter(f) {
   const d = `a.${ident(SCHEMA.a_date)}`;
-  const conds = [`a.${ident(SCHEMA.a_client)} = :clientKey`];
-  const params = { clientKey: f.clientKey };
+  const ck = clientKeys(f);
+  const conds = [`a.${ident(SCHEMA.a_client)} IN (${ck.placeholders})`];
+  const params = { ...ck.params };
 
   if (f.year)  { conds.push(`YEAR(${d}) = :year`);   params.year = Number(f.year); }
   if (f.month) { conds.push(`MONTH(${d}) = :month`); params.month = Number(f.month); }
   if (f.from)  { conds.push(`${d} >= :fromDate`);    params.fromDate = f.from; }
   if (f.to)    { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
+  if (f.service) { conds.push(`a.\`ServiceLevelName\` = :service`); params.service = String(f.service); }
 
-  let join = '';
-  if (f.service) {
-    join = `JOIN ${ident(SCHEMA.orders)} o ON o.${ident(SCHEMA.o_id)} = a.${ident(SCHEMA.a_order)}`;
-    conds.push(`o.${ident(SCHEMA.o_service)} = :service`);
-    params.service = String(f.service);
-  }
-  return { join, where: `WHERE ${conds.join(' AND ')}`, params };
+  return { where: `WHERE ${conds.join(' AND ')}`, params, date: d };
 }
 
 // ---------------------------------------------------------------------------
@@ -113,22 +121,22 @@ export async function orderTotals(f) {
   const { where, params } = orderFilter(f);
   const rows = await query(`
     SELECT
-      SUM(${ident(SCHEMA.o_value)})            AS totalSales,
-      COUNT(DISTINCT ${ident(SCHEMA.o_id)})    AS totalOrders,
-      SUM(CASE WHEN ${ident(SCHEMA.o_status)} = :completed THEN 1 ELSE 0 END) AS completedOrders,
-      AVG(${ident(SCHEMA.o_weight)})           AS avgWeightKg,
-      AVG(${ident(SCHEMA.o_cube)})             AS avgCubeM3,
-      AVG(${ident(SCHEMA.o_items)})            AS avgItemsPerOrder,
-      AVG(DATEDIFF(${ident(SCHEMA.o_proposed)},  ${ident(SCHEMA.o_received)})) AS avgReceivedToProposedDays,
-      AVG(DATEDIFF(${ident(SCHEMA.o_delivered)}, ${ident(SCHEMA.o_received)})) AS avgReceivedToDeliveredDays,
-      AVG(DATEDIFF(${ident(SCHEMA.o_delivered)}, ${ident(SCHEMA.o_created)}))  AS avgCreatedToDeliveredDays
+      SUM(${ident(SCHEMA.o_value)})             AS totalSales,
+      COUNT(DISTINCT ${ident(SCHEMA.o_id)})     AS totalOrders,
+      SUM(COALESCE(${ident(SCHEMA.o_completeFlag)}, 0)) AS completedOrders,
+      AVG(${ident(SCHEMA.o_weight)})            AS avgWeightKg,
+      AVG(${ident(SCHEMA.o_cube)})              AS avgCubeM3,
+      AVG(${ident(SCHEMA.o_items)})             AS avgItemsPerOrder,
+      AVG(${ident(SCHEMA.o_confToBook)})        AS avgReceivedToProposedDays,
+      AVG(${ident(SCHEMA.o_bookToDone)})        AS avgReceivedToDeliveredDays,
+      AVG(${ident(SCHEMA.o_confToDone)})        AS avgCreatedToDeliveredDays
     FROM ${ident(SCHEMA.orders)}
     ${where}
-  `, { ...params, completed: SCHEMA.o_completedValue });
+  `, params);
   return rows[0] || {};
 }
 
-// An order is first-time successful when it had exactly one attempt and it worked.
+// First time right: the order took exactly one visit, and that visit completed.
 export async function firstTimeSuccess(f) {
   const { where, params } = orderFilter(f, 'o');
   const rows = await query(`
@@ -136,34 +144,33 @@ export async function firstTimeSuccess(f) {
       (SELECT COUNT(*) FROM ${ident(SCHEMA.orders)} o ${where}) AS scopedOrders,
       SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END) AS firstTimeSuccessOrders
     FROM (
-      SELECT a.${ident(SCHEMA.a_order)} AS OrderId,
+      SELECT a.${ident(SCHEMA.a_order)} AS OrderID,
              COUNT(*) AS attempts,
-             SUM(CASE WHEN a.${ident(SCHEMA.a_status)} = :success THEN 1 ELSE 0 END) AS good
+             SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0)) AS good
       FROM ${ident(SCHEMA.attempts)} a
       JOIN ${ident(SCHEMA.orders)} o ON o.${ident(SCHEMA.o_id)} = a.${ident(SCHEMA.a_order)}
       ${where}
       GROUP BY a.${ident(SCHEMA.a_order)}
     ) t
-  `, { ...params, success: SCHEMA.a_successValue });
+  `, params);
   return rows[0] || {};
 }
 
 export async function attemptTotals(f) {
-  const { join, where, params } = attemptFilter(f);
+  const { where, params } = attemptFilter(f);
   const rows = await query(`
     SELECT
-      COUNT(*) AS total,
-      SUM(CASE WHEN a.${ident(SCHEMA.a_status)}   = :success THEN 1 ELSE 0 END) AS successful,
-      SUM(CASE WHEN a.${ident(SCHEMA.a_status)}   = :fail    THEN 1 ELSE 0 END) AS failed,
-      SUM(CASE WHEN a.${ident(SCHEMA.a_onTimeCol)} = :onTime THEN 1 ELSE 0 END) AS onTime
+      COUNT(*)                                            AS total,
+      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))       AS successful,
+      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0))     AS failed,
+      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))   AS onTime
     FROM ${ident(SCHEMA.attempts)} a
-    ${join}
     ${where}
-  `, { ...params, success: SCHEMA.a_successValue, fail: SCHEMA.a_failValue, onTime: SCHEMA.a_onTimeValue });
+  `, params);
   return rows[0] || {};
 }
 
-// Orders that never got an attempt at all.
+// Orders nobody has been out to yet.
 export async function noAttemptCount(f) {
   const { where, params } = orderFilter(f, 'o');
   const rows = await query(`
@@ -196,24 +203,21 @@ export async function byMonth(f) {
 }
 
 export async function attemptsByMonth(f) {
-  const { join, where, params } = attemptFilter(f);
-  const d = `a.${ident(SCHEMA.a_date)}`;
+  const { where, params, date } = attemptFilter(f);
   return query(`
     SELECT
-      YEAR(${d}) AS y, MONTH(${d}) AS m,
-      COUNT(*) AS total,
-      SUM(CASE WHEN a.${ident(SCHEMA.a_status)} = :success THEN 1 ELSE 0 END) AS successful,
-      SUM(CASE WHEN a.${ident(SCHEMA.a_status)} = :fail    THEN 1 ELSE 0 END) AS failed
+      YEAR(${date}) AS y, MONTH(${date}) AS m,
+      COUNT(*)                                        AS total,
+      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))   AS successful,
+      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0)) AS failed
     FROM ${ident(SCHEMA.attempts)} a
-    ${join}
     ${where}
-    GROUP BY YEAR(${d}), MONTH(${d})
+    GROUP BY YEAR(${date}), MONTH(${date})
     ORDER BY y, m
-  `, { ...params, success: SCHEMA.a_successValue, fail: SCHEMA.a_failValue });
+  `, params);
 }
 
-// Weeks run Monday to Sunday. WEEKDAY() is 0 on a Monday, so this lands on the
-// Monday of that week whatever the server's locale is set to.
+// Weeks run Monday to Sunday. WEEKDAY() is 0 on a Monday whatever the locale.
 export async function byWeek(f) {
   const { where, params, date } = orderFilter(f);
   const monday = `DATE_SUB(DATE(${date}), INTERVAL WEEKDAY(${date}) DAY)`;
@@ -231,15 +235,28 @@ export async function byWeek(f) {
   `, params);
 }
 
-// For the filter row: which years and service levels this client actually has.
 export async function facets(clientKey) {
-  const d = orderDate();
+  const d = oDate();
+  const ck = clientKeys({ clientKey });
   const [years, services] = await Promise.all([
-    query(`SELECT DISTINCT YEAR(${d}) AS y FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} = :clientKey ORDER BY y DESC`, { clientKey }),
-    query(`SELECT DISTINCT ${ident(SCHEMA.o_service)} AS s FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} = :clientKey AND ${ident(SCHEMA.o_service)} IS NOT NULL ORDER BY s`, { clientKey }),
+    query(`SELECT DISTINCT YEAR(${d}) AS y FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} IN (${ck.placeholders}) AND ${d} IS NOT NULL ORDER BY y DESC`, ck.params),
+    query(`SELECT DISTINCT ${ident(SCHEMA.o_service)} AS s FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} IN (${ck.placeholders}) AND ${ident(SCHEMA.o_service)} IS NOT NULL ORDER BY s`, ck.params),
   ]);
   return {
     years: years.map((r) => Number(r.y)).filter(Boolean),
     serviceLevels: services.map((r) => String(r.s)).filter(Boolean),
   };
+}
+
+// Every PartnerName in the extract, with how many orders each has. This is what
+// goes in CLIENT_MAP as sqlKey — SGK staff can read it straight off the service
+// instead of anyone having to run a query by hand.
+export async function partnerNames() {
+  return query(`
+    SELECT ${ident(SCHEMA.o_client)} AS partnerName, COUNT(*) AS orders
+    FROM ${ident(SCHEMA.orders)}
+    WHERE ${ident(SCHEMA.o_client)} IS NOT NULL AND ${ident(SCHEMA.o_client)} <> ''
+    GROUP BY ${ident(SCHEMA.o_client)}
+    ORDER BY orders DESC
+  `);
 }
