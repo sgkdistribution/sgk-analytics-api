@@ -44,6 +44,8 @@ export const SCHEMA = {
   o_confToBook:  env('SQL_ORDERS_CONF_TO_BOOK', 'OrderTimeConfToBook'),
   o_bookToDone:  env('SQL_ORDERS_BOOK_TO_DONE', 'OrderTimeBookToCompleted'),
   o_confToDone:  env('SQL_ORDERS_CONF_TO_DONE', 'OrderTimeConfToCompleted'),
+  o_bookReqFlag: env('SQL_ORDERS_BOOK_REQ_FLAG', 'OrderBookingReqFlag'),
+  o_bookConfFlag: env('SQL_ORDERS_BOOK_CONF_FLAG', 'OrderBookingConfFlag'),
 
   attempts:      env('SQL_ATTEMPTS_TABLE', 'stops'),
   a_client:      env('SQL_ATTEMPTS_CLIENT_COL', 'PartnerName'),
@@ -52,6 +54,9 @@ export const SCHEMA = {
   a_okFlag:      env('SQL_ATTEMPTS_OK_FLAG', 'StopStatusCompleteFlag'),
   a_failFlag:    env('SQL_ATTEMPTS_FAIL_FLAG', 'StopStatusFailedFlag'),
   a_onTimeFlag:  env('SQL_ATTEMPTS_ONTIME_FLAG', 'StopTimeOnTimeFlag'),
+  a_lateFlag:    env('SQL_ATTEMPTS_LATE_FLAG', 'StopTimeLateFlag'),
+  a_earlyFlag:   env('SQL_ATTEMPTS_EARLY_FLAG', 'StopTimeEarlyFlag'),
+  a_outstandFlag: env('SQL_ATTEMPTS_OUTSTANDING_FLAG', 'StopStatusOutstandingFlag'),
 };
 
 const oDate = (alias = '') => `${alias ? alias + '.' : ''}${ident(SCHEMA.o_date)}`;
@@ -129,11 +134,27 @@ export async function orderTotals(f) {
       AVG(${ident(SCHEMA.o_items)})             AS avgItemsPerOrder,
       AVG(${ident(SCHEMA.o_confToBook)})        AS avgReceivedToProposedDays,
       AVG(${ident(SCHEMA.o_bookToDone)})        AS avgReceivedToDeliveredDays,
-      AVG(${ident(SCHEMA.o_confToDone)})        AS avgCreatedToDeliveredDays
+      AVG(${ident(SCHEMA.o_confToDone)})        AS avgCreatedToDeliveredDays,
+      -- proposals the customer accepted first time round
+      SUM(COALESCE(${ident(SCHEMA.o_bookReqFlag)}, 0))  AS bookingsRequested,
+      SUM(COALESCE(${ident(SCHEMA.o_bookConfFlag)}, 0)) AS bookingsConfirmed
     FROM ${ident(SCHEMA.orders)}
     ${where}
   `, params);
   return rows[0] || {};
+}
+
+// Split of orders across the PartnerName values this company owns — the pie on
+// the first page of the report.
+export async function byPartner(f) {
+  const { where, params } = orderFilter(f);
+  return query(`
+    SELECT ${ident(SCHEMA.o_client)} AS name, COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders
+    FROM ${ident(SCHEMA.orders)}
+    ${where}
+    GROUP BY ${ident(SCHEMA.o_client)}
+    ORDER BY orders DESC
+  `, params);
 }
 
 // First time right: the order took exactly one visit, and that visit completed.
@@ -163,7 +184,10 @@ export async function attemptTotals(f) {
       COUNT(*)                                            AS total,
       SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))       AS successful,
       SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0))     AS failed,
-      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))   AS onTime
+      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))    AS onTime,
+      SUM(COALESCE(a.${ident(SCHEMA.a_lateFlag)}, 0))      AS late,
+      SUM(COALESCE(a.${ident(SCHEMA.a_earlyFlag)}, 0))     AS early,
+      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0))  AS outstanding
     FROM ${ident(SCHEMA.attempts)} a
     ${where}
   `, params);
@@ -194,7 +218,10 @@ export async function byMonth(f) {
       COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders,
       AVG(${ident(SCHEMA.o_weight)})        AS avgWeightKg,
       AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3,
-      AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder
+      AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder,
+      AVG(${ident(SCHEMA.o_confToDone)})    AS avgConfToCompletedDays,
+      AVG(${ident(SCHEMA.o_bookToDone)})    AS avgReceivedToDeliveredDays,
+      AVG(${ident(SCHEMA.o_confToBook)})    AS avgReceivedToProposedDays
     FROM ${ident(SCHEMA.orders)}
     ${where}
     GROUP BY YEAR(${date}), MONTH(${date})
@@ -209,7 +236,8 @@ export async function attemptsByMonth(f) {
       YEAR(${date}) AS y, MONTH(${date}) AS m,
       COUNT(*)                                        AS total,
       SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))   AS successful,
-      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0)) AS failed
+      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0)) AS failed,
+      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0)) AS unknown
     FROM ${ident(SCHEMA.attempts)} a
     ${where}
     GROUP BY YEAR(${date}), MONTH(${date})
@@ -227,7 +255,8 @@ export async function byWeek(f) {
       SUM(${ident(SCHEMA.o_value)})         AS sales,
       COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders,
       AVG(${ident(SCHEMA.o_weight)})        AS avgWeightKg,
-      AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3
+      AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3,
+      AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder
     FROM ${ident(SCHEMA.orders)}
     ${where}
     GROUP BY ${monday}

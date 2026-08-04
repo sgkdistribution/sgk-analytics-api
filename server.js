@@ -145,9 +145,9 @@ app.get('/analytics/overview', async (req, res) => {
     const key = JSON.stringify(f);
 
     const data = await cached(key, async () => {
-      const [totals, firstTime, attempts, noAttempt, months, attemptMonths, weeks, facets] = await Promise.all([
+      const [totals, firstTime, attempts, noAttempt, months, attemptMonths, weeks, facets, partners] = await Promise.all([
         Q.orderTotals(f), Q.firstTimeSuccess(f), Q.attemptTotals(f), Q.noAttemptCount(f),
-        Q.byMonth(f), Q.attemptsByMonth(f), Q.byWeek(f), Q.facets(company.sqlKey),
+        Q.byMonth(f), Q.attemptsByMonth(f), Q.byWeek(f), Q.facets(company.sqlKey), Q.byPartner(f),
       ]);
 
       const attemptByKey = new Map(attemptMonths.map((r) => [`${r.y}-${r.m}`, r]));
@@ -162,7 +162,15 @@ app.get('/analytics/overview', async (req, res) => {
           attempts: total,
           successful: Number(a.successful || 0),
           failed: Number(a.failed || 0),
+          unknown: Number(a.unknown || 0),
           successRatio: pct(Number(a.successful || 0), total),
+          firstTimeRatio: null,
+          avgConfToCompletedDays: num(r.avgConfToCompletedDays),
+          avgReceivedToDeliveredDays: num(r.avgReceivedToDeliveredDays),
+          avgReceivedToProposedDays: num(r.avgReceivedToProposedDays),
+          trendSuccessful: Number(a.successful || 0),
+          trendFailed: Number(a.failed || 0),
+          trendNoAttempt: Number(a.unknown || 0),
         };
       });
 
@@ -174,6 +182,7 @@ app.get('/analytics/overview', async (req, res) => {
           label: `${ddMon(start)} - ${ddMon(end)} ${String(end.getUTCFullYear()).slice(2)}`,
           sales: num(r.sales), orders: Number(r.orders || 0),
           avgWeightKg: num(r.avgWeightKg), avgCubeM3: num(r.avgCubeM3),
+          avgItemsPerOrder: num(r.avgItemsPerOrder),
         };
       });
 
@@ -192,19 +201,33 @@ app.get('/analytics/overview', async (req, res) => {
           avgReceivedToProposedDays: num(totals.avgReceivedToProposedDays),
           avgReceivedToDeliveredDays: num(totals.avgReceivedToDeliveredDays),
           avgCreatedToDeliveredDays: num(totals.avgCreatedToDeliveredDays),
+          avgConfToCompletedDays: num(totals.avgCreatedToDeliveredDays),
           firstTimeSuccessOrders: ftsOrders,
           firstTimeSuccessRatio: pct(ftsOrders, scopedOrders),
+          firstTimeProposalAcceptance: pct(Number(totals.bookingsConfirmed || 0), Number(totals.bookingsRequested || 0)),
         },
         attempts: {
           total: totalAttempts,
           successful: Number(attempts.successful || 0),
           failed: Number(attempts.failed || 0),
+          unknown: Number(attempts.outstanding || 0),
           noAttempt,
           successRatio: pct(Number(attempts.successful || 0), totalAttempts),
           onTimePct: pct(Number(attempts.onTime || 0), totalAttempts),
+          statusBreakdown: [
+            { label: 'On Time', count: Number(attempts.onTime || 0), pct: pct(Number(attempts.onTime || 0), totalAttempts) },
+            { label: 'Unknown', count: Number(attempts.outstanding || 0), pct: pct(Number(attempts.outstanding || 0), totalAttempts) },
+            { label: 'Late', count: Number(attempts.late || 0), pct: pct(Number(attempts.late || 0), totalAttempts) },
+            { label: 'Early', count: Number(attempts.early || 0), pct: pct(Number(attempts.early || 0), totalAttempts) },
+          ],
         },
         byMonth,
         byWeek,
+        byPartner: partners.map((p) => ({
+          name: String(p.name),
+          orders: Number(p.orders || 0),
+          pct: pct(Number(p.orders || 0), partners.reduce((n, x) => n + Number(x.orders || 0), 0)),
+        })),
         facets,
       };
     });
