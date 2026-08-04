@@ -16,6 +16,7 @@ import { verifyToken, authConfigured } from './auth.js';
 import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.js';
 import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
+import { demoPayload, demoEnabled } from './demo.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -59,7 +60,13 @@ app.get('/health', async (_req, res) => {
   if (sqlConfigured()) {
     try { await ping(); db = 'connected'; } catch (e) { db = `error: ${e?.message || e}`; }
   }
-  res.json({ ok: true, db, auth: authConfigured() ? 'configured' : 'not configured', clients: listCompanies().length });
+  res.json({
+    ok: true,
+    db,
+    auth: authConfigured() ? 'configured' : 'not configured',
+    clients: listCompanies().length,
+    ...(demoEnabled() ? { demo: 'ON — serving frozen sample data, not live figures' } : {}),
+  });
 });
 
 // DIAGNOSTIC. Answers "who does the server think I am, and why did my lookup
@@ -100,7 +107,9 @@ app.get('/analytics/companies', async (req, res) => {
 
 app.get('/analytics/overview', async (req, res) => {
   try {
-    if (!sqlConfigured()) return res.status(503).json({ error: 'The analytics database is not connected yet.' });
+    if (!sqlConfigured() && !demoEnabled()) {
+      return res.status(503).json({ error: 'The analytics database is not connected yet.' });
+    }
 
     const identity = await verifyToken(req.headers.authorization);
     const { staff, company } = resolveCompany(identity, { companyId: req.query.company, companyName: req.query.companyName });
@@ -117,6 +126,22 @@ app.get('/analytics/overview', async (req, res) => {
       to: req.query.to || null,
       service: req.query.service || null,
     };
+    // DEMO MODE. Note where this sits: AFTER the token has been verified and the
+    // company resolved, so the same access rules apply. It is switched on only
+    // by DEMO_MODE=true, never by the database being unreachable, and the
+    // response is flagged demo:true so the page can say so on screen.
+    if (demoEnabled()) {
+      console.warn('[analytics] DEMO MODE is on — serving the frozen snapshot, not live data');
+      return res.json({
+        company: { id: company.companyId, name: company.name },
+        staff,
+        demo: true,
+        filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
+        generatedAt: new Date().toISOString(),
+        ...demoPayload(f),
+      });
+    }
+
     const key = JSON.stringify(f);
 
     const data = await cached(key, async () => {
