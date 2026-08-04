@@ -10,6 +10,13 @@
 // database is unreachable — silent fallback to frozen figures is how people end
 // up making decisions on fiction.
 //
+// AND IT IS SCOPED TO ONE COMPANY. This snapshot belongs to Roseland, so only
+// Roseland's account can ever be shown it. Any other company asking for figures
+// while demo mode is on gets nothing back from here and falls through to the
+// live path — because showing one client another client's numbers, even frozen
+// ones, even in a demo, is the single worst thing this service could do.
+// DEMO_COMPANIES controls which company ids the snapshot may be served to.
+//
 // One inconsistency in the original, reproduced faithfully rather than quietly
 // corrected: the headline "Successful Attempts" card (55,646) does not agree
 // with the monthly Delivery Attempt table (56,727). They are different measures
@@ -76,6 +83,23 @@ const ATTEMPT_STATUS = [
 ];
 
 const r2 = (n) => Number(n.toFixed(2));
+
+// Which company ids this snapshot may be served to. Roseland only, unless
+// deliberately widened.
+const allowedCompanies = () => String(process.env.DEMO_COMPANIES || 'roseland')
+  .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+
+// Returns the snapshot ONLY if this company owns it, otherwise null.
+export function demoFor(companyId, companyName, filters = {}) {
+  const id = String(companyId || '').toLowerCase();
+  const name = String(companyName || '').toLowerCase();
+  const allowed = allowedCompanies();
+  if (!allowed.includes(id) && !allowed.some((a) => name.includes(a))) {
+    console.warn(`[demo] refusing to serve the Roseland snapshot to "${companyName || companyId}"`);
+    return null;
+  }
+  return demoPayload(filters);
+}
 
 export function demoPayload(filters = {}) {
   let rows = M.map((m, i) => ({ m, monthNo: i + 1 }));

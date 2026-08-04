@@ -16,7 +16,7 @@ import { verifyToken, authConfigured } from './auth.js';
 import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.js';
 import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
-import { demoPayload, demoEnabled } from './demo.js';
+import { demoFor, demoEnabled } from './demo.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -131,15 +131,24 @@ app.get('/analytics/overview', async (req, res) => {
     // by DEMO_MODE=true, never by the database being unreachable, and the
     // response is flagged demo:true so the page can say so on screen.
     if (demoEnabled()) {
-      console.warn('[analytics] DEMO MODE is on — serving the frozen snapshot, not live data');
-      return res.json({
-        company: { id: company.companyId, name: company.name },
-        staff,
-        demo: true,
-        filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
-        generatedAt: new Date().toISOString(),
-        ...demoPayload(f),
-      });
+      // Scoped to the company that owns the snapshot. Anyone else falls through
+      // to the live path and sees an honest error rather than another client's
+      // figures.
+      const snapshot = demoFor(company.companyId, company.name, f);
+      if (snapshot) {
+        console.warn('[analytics] DEMO MODE — serving the frozen snapshot for', company.name);
+        return res.json({
+          company: { id: company.companyId, name: company.name },
+          staff,
+          demo: true,
+          filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
+          generatedAt: new Date().toISOString(),
+          ...snapshot,
+        });
+      }
+      if (!sqlConfigured()) {
+        return res.status(503).json({ error: `No sample data is configured for ${company.name}, and the live database is not connected.` });
+      }
     }
 
     const key = JSON.stringify(f);
