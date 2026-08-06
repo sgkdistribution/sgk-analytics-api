@@ -16,9 +16,52 @@
 //     concatenated into a query.
 //   * Statement timeout, so one heavy query cannot pin a connection.
 // ---------------------------------------------------------------------------
+import fs from 'node:fs';
 import mysql from 'mysql2/promise';
 
 let pool = null;
+
+// Read a certificate file if one is configured. Missing or unreadable is loud
+// rather than silent — a connection that quietly falls back to plain text is
+// worse than one that refuses to start.
+function readPem(envKey) {
+  const path = process.env[envKey];
+  if (!path) return null;
+  try {
+    return fs.readFileSync(path);
+  } catch (e) {
+    throw new Error(`${envKey} points at ${path} but it could not be read: ${e.message}`);
+  }
+}
+
+// Mutual TLS with Cloud SQL, if the three files are configured.
+//
+// A note on hostname checking. Cloud SQL server certificates carry the INSTANCE
+// name, not the IP address we dial, so Node's default hostname match can never
+// succeed here. The chain check is the one that matters and it stays on: this CA
+// is issued per instance, so a certificate that chains to it can only have come
+// from this database. Skipping the name match while verifying the chain is the
+// documented way to connect to Cloud SQL by IP.
+function sslOptions() {
+  const ca = readPem('SQL_SSL_CA');
+  const cert = readPem('SQL_SSL_CERT');
+  const key = readPem('SQL_SSL_KEY');
+
+  if (ca && cert && key) {
+    return {
+      ca, cert, key,
+      rejectUnauthorized: true,
+      checkServerIdentity: () => undefined,
+    };
+  }
+  if (ca || cert || key) {
+    throw new Error('SSL is half configured — SQL_SSL_CA, SQL_SSL_CERT and SQL_SSL_KEY must all be set, or none of them.');
+  }
+  // No certificates supplied: encrypt anyway unless explicitly told not to.
+  return process.env.SQL_ENCRYPT === 'false'
+    ? undefined
+    : { rejectUnauthorized: process.env.SQL_TRUST_CERT !== 'true' };
+}
 
 // People paste "host:port" — it is how connection details are always written
 // down. Split it rather than failing with an unreadable DNS error.
@@ -44,11 +87,9 @@ export function getPool() {
     database: process.env.SQL_DATABASE,
     user: process.env.SQL_USER,
     password: process.env.SQL_PASSWORD,
-    // The connection crosses the public internet, so encrypt it. Set
-    // SQL_ENCRYPT=false only if the server genuinely does not offer TLS.
-    ssl: process.env.SQL_ENCRYPT === 'false'
-      ? undefined
-      : { rejectUnauthorized: process.env.SQL_TRUST_CERT !== 'true' },
+    // The connection crosses the public internet, so it is encrypted, and with
+    // the Cloud SQL client certificates it is mutually authenticated too.
+    ssl: sslOptions(),
     connectionLimit: Number(process.env.SQL_POOL_MAX || 6),
     waitForConnections: true,
     connectTimeout: 15000,
@@ -58,7 +99,9 @@ export function getPool() {
     timezone: 'Z',
   });
 
-  console.log('[db] pool ready for', `${host}:${port}`, '/', process.env.SQL_DATABASE);
+  const mtls = Boolean(process.env.SQL_SSL_CA && process.env.SQL_SSL_CERT && process.env.SQL_SSL_KEY);
+  console.log('[db] pool ready for', `${host}:${port}`, '/', process.env.SQL_DATABASE,
+    mtls ? '(TLS, client certificate)' : (process.env.SQL_ENCRYPT === 'false' ? '(NOT encrypted)' : '(TLS)'));
   return pool;
 }
 
