@@ -94,6 +94,18 @@ export function avgSecondsExpr(colType, quotedCol, unit = configuredUnit()) {
   return per === 1 ? `AVG(${quotedCol})` : `AVG(${quotedCol}) * ${per}`;
 }
 
+/**
+ * The SQL that turns one duration column into a SUM of SECONDS.
+ *
+ * The rollup needs SUM and COUNT rather than AVG, because an average of averages
+ * is not an average — see the note at the top of rollup.js.
+ */
+export function sumSecondsExpr(colType, quotedCol, unit = configuredUnit()) {
+  if (TIME_TYPES.has(colType)) return `SUM(TIME_TO_SEC(${quotedCol}))`;
+  const per = SECONDS_PER[unit] || 1;
+  return per === 1 ? `SUM(${quotedCol})` : `SUM(${quotedCol}) * ${per}`;
+}
+
 /** Seconds -> days, to two decimals. null stays null so the tile shows a dash. */
 export function secondsToDays(sec) {
   if (sec === null || sec === undefined || Number.isNaN(Number(sec))) return null;

@@ -18,6 +18,7 @@ import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
 import { demoFor, demoEnabled } from './demo.js';
 import { secondsToDays, secondsToHours, humanDuration, interpretations, configuredUnit } from './durations.js';
+import { meanOf, foldRows, foldAttempts, forMonth, partnerTotals, weekTotals, monthTotals } from './rollup.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -265,124 +266,130 @@ app.get('/analytics/overview', async (req, res) => {
       }
     }
 
-    const key = JSON.stringify(f);
+    // -----------------------------------------------------------------------
+    // THE YEAR IS THE CACHE KEY — NOT THE MONTH.
+    //
+    // This is what makes changing the month instant. The year is read once, at
+    // (month, week, partner) grain, and every month is added up from that in
+    // memory. Picking February used to be a cold build of nine queries; it is
+    // now zero queries.
+    //
+    // The month is deliberately left OUT of the key. Twelve months sharing one
+    // cached year is the entire point — putting the month back in would restore
+    // the old behaviour without anything looking wrong.
+    // -----------------------------------------------------------------------
+    const yearKey = JSON.stringify({ clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service });
 
-    // FACETS ARE CACHED SEPARATELY AND FOR MUCH LONGER. They are the Year and
-    // Service Level dropdowns — they do not depend on the filters at all, yet
-    // they were inside the per-filter cache, so changing the year re-ran two
-    // DISTINCT scans over the whole client's history to rebuild a list that had
-    // not changed. Keyed by the company's sqlKey, so it is still per company.
     const facetsKey = `facets:${JSON.stringify(company.sqlKey)}`;
     const facetsPromise = cachedLong(facetsKey, () => Q.facets(company.sqlKey));
 
-    const data = await cached(key, async () => {
-      const [totals, firstTime, attempts, noAttempt, months, attemptMonths, weeks, facets, partners] = await Promise.all([
-        Q.orderTotals(f), Q.firstTimeSuccess(f), Q.attemptTotals(f), Q.noAttemptCount(f),
-        Q.byMonth(f), Q.attemptsByMonth(f), Q.byWeek(f), facetsPromise, Q.byPartner(f),
-      ]);
+    const startedAt = Date.now();
+    const roll = await cached(yearKey, () => Q.yearRollup(f));
+    const facets = await facetsPromise;
+    // Cold builds are the only ones that touch the database now. Logged so a
+    // slow year is visible without anyone having to reproduce it.
+    const tookMs = Date.now() - startedAt;
+    if (tookMs > 1000) console.log(`[analytics] built ${f.year || 'all'} for ${company.name} in ${tookMs}ms`);
 
-      const attemptByKey = new Map(attemptMonths.map((r) => [`${r.y}-${r.m}`, r]));
-      const byMonth = months.map((r) => {
-        const a = attemptByKey.get(`${r.y}-${r.m}`) || {};
-        const total = Number(a.total || 0);
-        return {
-          key: `${r.y}-${String(r.m).padStart(2, '0')}`,
-          label: `${MONTHS[r.m - 1]} ${r.y}`,
-          sales: num(r.sales), orders: Number(r.orders || 0),
-          avgWeightKg: num(r.avgWeightKg), avgCubeM3: num(r.avgCubeM3), avgItemsPerOrder: num(r.avgItemsPerOrder),
-          attempts: total,
-          successful: Number(a.successful || 0),
-          failed: Number(a.failed || 0),
-          unknown: Number(a.unknown || 0),
-          successRatio: pct(Number(a.successful || 0), total),
-          firstTimeRatio: null,
-          avgConfToCompletedDays: secondsToDays(r.avgConfToCompletedSec),
-          avgReceivedToDeliveredDays: secondsToDays(r.avgReceivedToDeliveredSec),
-          avgReceivedToProposedDays: secondsToDays(r.avgReceivedToProposedSec),
-          trendSuccessful: Number(a.successful || 0),
-          trendFailed: Number(a.failed || 0),
-          trendNoAttempt: Number(a.unknown || 0),
-        };
-      });
+    // ---- everything below is arithmetic on what is already in memory ----
+    const rows = forMonth(roll.orderRows, f.month);
+    const totals = foldRows(rows);
+    const attempts = foldAttempts(forMonth(roll.attemptRows, f.month));
+    const perOrder = forMonth(roll.perOrderRows, f.month)
+      .reduce((a, r) => ({
+        noAttempt: a.noAttempt + Number(r.noAttempt || 0),
+        firstTime: a.firstTime + Number(r.firstTime || 0),
+        scopedOrders: a.scopedOrders + Number(r.scopedOrders || 0),
+      }), { noAttempt: 0, firstTime: 0, scopedOrders: 0 });
 
-      const byWeek = weeks.map((r) => {
-        const start = new Date(r.weekStart);
-        const end = new Date(start); end.setUTCDate(end.getUTCDate() + 6);
-        return {
-          key: start.toISOString().slice(0, 10),
-          label: `${ddMon(start)} - ${ddMon(end)} ${String(end.getUTCFullYear()).slice(2)}`,
-          sales: num(r.sales), orders: Number(r.orders || 0),
-          avgWeightKg: num(r.avgWeightKg), avgCubeM3: num(r.avgCubeM3),
-          avgItemsPerOrder: num(r.avgItemsPerOrder),
-        };
-      });
-
-      const totalAttempts = Number(attempts.total || 0);
-      // Was a second COUNT(*) inside firstTimeSuccess; OrderID is the primary key
-      // so this is the same number for one less pass over the table.
-      const scopedOrders = Number(totals.totalOrders || 0);
-      const ftsOrders = Number(firstTime.firstTimeSuccessOrders || 0);
-
+    const attemptByKey = new Map(roll.attemptRows.map((r) => [`${r.y}-${r.m}`, r]));
+    const byMonth = monthTotals(rows).map((b) => {
+      const a = attemptByKey.get(`${b.y}-${b.m}`) || {};
+      const total = Number(a.total || 0);
       return {
-        orders: {
-          totalSales: num(totals.totalSales),
-          totalOrders: Number(totals.totalOrders || 0),
-          completedOrders: Number(totals.completedOrders || 0),
-          avgWeightKg: num(totals.avgWeightKg),
-          avgCubeM3: num(totals.avgCubeM3),
-          avgItemsPerOrder: num(totals.avgItemsPerOrder),
-          // DURATIONS. Two things were wrong here.
-          //
-          // 1. The unit. These came straight out of SQL and were labelled "days"
-          //    on an assumption nobody checked — hence "384,329.26 days", which
-          //    is a thousand years. They are now seconds by the time they reach
-          //    this line, converted from whatever the column actually stores.
-          //
-          // 2. THE LAST LINE READ THE WRONG FIELD. avgConfToCompleted was fed
-          //    avgCreatedToDelivered, so two tiles showed one number twice and
-          //    it looked like a coincidence rather than a bug.
-          //
-          // Days and hours are both sent: "0.06 days" tells a reader nothing,
-          // and the page picks whichever suits the size.
-          avgReceivedToProposedDays: secondsToDays(totals.avgReceivedToProposedSec),
-          avgReceivedToDeliveredDays: secondsToDays(totals.avgReceivedToDeliveredSec),
-          avgCreatedToDeliveredDays: secondsToDays(totals.avgConfToCompletedSec),
-          avgConfToCompletedDays: secondsToDays(totals.avgConfToCompletedSec),
-          avgReceivedToProposedHours: secondsToHours(totals.avgReceivedToProposedSec),
-          avgReceivedToDeliveredHours: secondsToHours(totals.avgReceivedToDeliveredSec),
-          avgConfToCompletedHours: secondsToHours(totals.avgConfToCompletedSec),
-          avgReceivedToProposedText: humanDuration(totals.avgReceivedToProposedSec),
-          avgReceivedToDeliveredText: humanDuration(totals.avgReceivedToDeliveredSec),
-          avgConfToCompletedText: humanDuration(totals.avgConfToCompletedSec),
-          firstTimeSuccessOrders: ftsOrders,
-          firstTimeSuccessRatio: pct(ftsOrders, scopedOrders),
-          firstTimeProposalAcceptance: pct(Number(totals.bookingsConfirmed || 0), Number(totals.bookingsRequested || 0)),
-        },
-        attempts: {
-          total: totalAttempts,
-          successful: Number(attempts.successful || 0),
-          failed: Number(attempts.failed || 0),
-          unknown: Number(attempts.outstanding || 0),
-          noAttempt,
-          successRatio: pct(Number(attempts.successful || 0), totalAttempts),
-          onTimePct: pct(Number(attempts.onTime || 0), totalAttempts),
-          statusBreakdown: [
-            { label: 'On Time', count: Number(attempts.onTime || 0), pct: pct(Number(attempts.onTime || 0), totalAttempts) },
-            { label: 'Unknown', count: Number(attempts.outstanding || 0), pct: pct(Number(attempts.outstanding || 0), totalAttempts) },
-            { label: 'Late', count: Number(attempts.late || 0), pct: pct(Number(attempts.late || 0), totalAttempts) },
-            { label: 'Early', count: Number(attempts.early || 0), pct: pct(Number(attempts.early || 0), totalAttempts) },
-          ],
-        },
-        byMonth,
-        byWeek,
-        byPartner: partners.map((p) => ({
-          name: String(p.name),
-          orders: Number(p.orders || 0),
-          pct: pct(Number(p.orders || 0), partners.reduce((n, x) => n + Number(x.orders || 0), 0)),
-        })),
-        facets,
+        key: `${b.y}-${String(b.m).padStart(2, '0')}`,
+        label: `${MONTHS[b.m - 1]} ${b.y}`,
+        sales: num(b.sales), orders: b.orders,
+        avgWeightKg: num(meanOf(b.weightSum, b.weightCnt)),
+        avgCubeM3: num(meanOf(b.cubeSum, b.cubeCnt)),
+        avgItemsPerOrder: num(meanOf(b.itemsSum, b.itemsCnt)),
+        attempts: total,
+        successful: Number(a.successful || 0),
+        failed: Number(a.failed || 0),
+        unknown: Number(a.outstanding || 0),
+        successRatio: pct(Number(a.successful || 0), total),
+        firstTimeRatio: null,
+        avgConfToCompletedDays: secondsToDays(meanOf(b.confToDoneSum, b.confToDoneCnt)),
+        avgReceivedToDeliveredDays: secondsToDays(meanOf(b.bookToDoneSum, b.bookToDoneCnt)),
+        avgReceivedToProposedDays: secondsToDays(meanOf(b.confToBookSum, b.confToBookCnt)),
+        trendSuccessful: Number(a.successful || 0),
+        trendFailed: Number(a.failed || 0),
+        trendNoAttempt: Number(a.outstanding || 0),
       };
     });
+
+    const byWeek = weekTotals(rows).map((w) => {
+      const start = new Date(w.weekStart);
+      const end = new Date(start); end.setUTCDate(end.getUTCDate() + 6);
+      return {
+        key: start.toISOString().slice(0, 10),
+        label: `${ddMon(start)} - ${ddMon(end)} ${String(end.getUTCFullYear()).slice(2)}`,
+        sales: num(w.sales), orders: w.orders,
+        avgWeightKg: num(meanOf(w.weightSum, w.weightCnt)),
+        avgCubeM3: num(meanOf(w.cubeSum, w.cubeCnt)),
+        avgItemsPerOrder: num(meanOf(w.itemsSum, w.itemsCnt)),
+      };
+    });
+
+    const partners = partnerTotals(rows);
+    const partnerSum = partners.reduce((n, x) => n + x.orders, 0);
+    const totalAttempts = attempts.total;
+    const secProposed = meanOf(totals.confToBookSum, totals.confToBookCnt);
+    const secDelivered = meanOf(totals.bookToDoneSum, totals.bookToDoneCnt);
+    const secCompleted = meanOf(totals.confToDoneSum, totals.confToDoneCnt);
+
+    const data = {
+      orders: {
+        totalSales: num(totals.sales),
+        totalOrders: totals.orders,
+        completedOrders: totals.completed,
+        avgWeightKg: num(meanOf(totals.weightSum, totals.weightCnt)),
+        avgCubeM3: num(meanOf(totals.cubeSum, totals.cubeCnt)),
+        avgItemsPerOrder: num(meanOf(totals.itemsSum, totals.itemsCnt)),
+        avgReceivedToProposedDays: secondsToDays(secProposed),
+        avgReceivedToDeliveredDays: secondsToDays(secDelivered),
+        avgCreatedToDeliveredDays: secondsToDays(secCompleted),
+        avgConfToCompletedDays: secondsToDays(secCompleted),
+        avgReceivedToProposedHours: secondsToHours(secProposed),
+        avgReceivedToDeliveredHours: secondsToHours(secDelivered),
+        avgConfToCompletedHours: secondsToHours(secCompleted),
+        avgReceivedToProposedText: humanDuration(secProposed),
+        avgReceivedToDeliveredText: humanDuration(secDelivered),
+        avgConfToCompletedText: humanDuration(secCompleted),
+        firstTimeSuccessOrders: perOrder.firstTime,
+        firstTimeSuccessRatio: pct(perOrder.firstTime, perOrder.scopedOrders || totals.orders),
+        firstTimeProposalAcceptance: pct(totals.bookConf, totals.bookReq),
+      },
+      attempts: {
+        total: totalAttempts,
+        successful: attempts.successful,
+        failed: attempts.failed,
+        unknown: attempts.outstanding,
+        noAttempt: perOrder.noAttempt,
+        successRatio: pct(attempts.successful, totalAttempts),
+        onTimePct: pct(attempts.onTime, totalAttempts),
+        statusBreakdown: [
+          { label: 'On Time', count: attempts.onTime, pct: pct(attempts.onTime, totalAttempts) },
+          { label: 'Unknown', count: attempts.outstanding, pct: pct(attempts.outstanding, totalAttempts) },
+          { label: 'Late', count: attempts.late, pct: pct(attempts.late, totalAttempts) },
+          { label: 'Early', count: attempts.early, pct: pct(attempts.early, totalAttempts) },
+        ],
+      },
+      byMonth,
+      byWeek,
+      byPartner: partners.map((p) => ({ name: p.name, orders: p.orders, pct: pct(p.orders, partnerSum) })),
+      facets,
+    };
 
     res.json({
       company: { id: company.companyId, name: company.name },

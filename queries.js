@@ -17,7 +17,7 @@
 // now the actual column names, so nothing needs setting for it to work.
 // ---------------------------------------------------------------------------
 import { query } from './db.js';
-import { avgSecondsExpr, columnTypes, configuredUnit } from './durations.js';
+import { avgSecondsExpr, sumSecondsExpr, columnTypes, configuredUnit } from './durations.js';
 
 const env = (k, fallback) => (process.env[k] || fallback);
 
@@ -345,6 +345,90 @@ export async function byWeek(f) {
     GROUP BY ${monday}
     ORDER BY weekStart
   `, params);
+}
+
+// ---------------------------------------------------------------------------
+// THE YEAR, IN THREE QUERIES.
+//
+// This replaces nine per-view queries with three per YEAR. Everything the
+// dashboard shows for the whole year, any single month, any week and any partner
+// is added up from these three results in memory — so changing the month costs
+// no database work at all. See rollup.js for how, and why averages are carried
+// as SUM + COUNT rather than as averages.
+//
+// The month is deliberately DROPPED from the filter here: the point is to read
+// the year once and slice it afterwards.
+// ---------------------------------------------------------------------------
+export async function yearRollup(f) {
+  const yearOnly = { ...f, month: null };
+  const { where, params, date } = orderFilter(yearOnly);
+  const aFilter = attemptFilter(yearOnly);
+  const monday = `DATE_SUB(DATE(${date}), INTERVAL WEEKDAY(${date}) DAY)`;
+
+  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
+  const durSum = (col) => sumSecondsExpr(t[col], ident(col));
+
+  // 1. ORDERS, at (month, week, partner) grain — about 120 rows for a year.
+  const ordersP = query(`
+    SELECT
+      YEAR(${date}) AS y, MONTH(${date}) AS m,
+      ${monday} AS weekStart,
+      ${ident(SCHEMA.o_client)} AS partner,
+      SUM(${ident(SCHEMA.o_value)})                     AS sales,
+      COUNT(DISTINCT ${ident(SCHEMA.o_id)})             AS orders,
+      SUM(COALESCE(${ident(SCHEMA.o_completeFlag)}, 0)) AS completed,
+      SUM(COALESCE(${ident(SCHEMA.o_bookReqFlag)}, 0))  AS bookReq,
+      SUM(COALESCE(${ident(SCHEMA.o_bookConfFlag)}, 0)) AS bookConf,
+      SUM(${ident(SCHEMA.o_weight)}) AS weightSum, COUNT(${ident(SCHEMA.o_weight)}) AS weightCnt,
+      SUM(${ident(SCHEMA.o_cube)})   AS cubeSum,   COUNT(${ident(SCHEMA.o_cube)})   AS cubeCnt,
+      SUM(${ident(SCHEMA.o_items)})  AS itemsSum,  COUNT(${ident(SCHEMA.o_items)})  AS itemsCnt,
+      ${durSum(SCHEMA.o_confToBook)} AS confToBookSum, COUNT(${ident(SCHEMA.o_confToBook)}) AS confToBookCnt,
+      ${durSum(SCHEMA.o_bookToDone)} AS bookToDoneSum, COUNT(${ident(SCHEMA.o_bookToDone)}) AS bookToDoneCnt,
+      ${durSum(SCHEMA.o_confToDone)} AS confToDoneSum, COUNT(${ident(SCHEMA.o_confToDone)}) AS confToDoneCnt
+    FROM ${ident(SCHEMA.orders)}
+    ${where}
+    GROUP BY y, m, weekStart, partner
+  `, params);
+
+  // 2. ATTEMPTS, by month.
+  const attemptsP = query(`
+    SELECT
+      YEAR(${aFilter.date}) AS y, MONTH(${aFilter.date}) AS m,
+      COUNT(*)                                            AS total,
+      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))       AS successful,
+      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0))     AS failed,
+      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))   AS onTime,
+      SUM(COALESCE(a.${ident(SCHEMA.a_lateFlag)}, 0))     AS late,
+      SUM(COALESCE(a.${ident(SCHEMA.a_earlyFlag)}, 0))    AS early,
+      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0)) AS outstanding
+    FROM ${ident(SCHEMA.attempts)} a
+    ${aFilter.where}
+    GROUP BY y, m
+  `, aFilter.params);
+
+  // 3. PER-ORDER attempt counts, by month — first-time success and the orders
+  //    nobody has been out to. A LEFT JOIN gets both from ONE pass; they used to
+  //    be two separate queries over the same two tables.
+  const perOrderP = query(`
+    SELECT t.y, t.m,
+      SUM(CASE WHEN t.attempts = 0 THEN 1 ELSE 0 END)                    AS noAttempt,
+      SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END)     AS firstTime,
+      COUNT(*)                                                           AS scopedOrders
+    FROM (
+      SELECT YEAR(${oDate('o')}) AS y, MONTH(${oDate('o')}) AS m,
+             o.${ident(SCHEMA.o_id)} AS oid,
+             COUNT(a.${ident(SCHEMA.a_order)}) AS attempts,
+             SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0)) AS good
+      FROM ${ident(SCHEMA.orders)} o
+      LEFT JOIN ${ident(SCHEMA.attempts)} a ON a.${ident(SCHEMA.a_order)} = o.${ident(SCHEMA.o_id)}
+      ${orderFilter(yearOnly, 'o').where}
+      GROUP BY y, m, oid
+    ) t
+    GROUP BY t.y, t.m
+  `, orderFilter(yearOnly, 'o').params);
+
+  const [orderRows, attemptRows, perOrderRows] = await Promise.all([ordersP, attemptsP, perOrderP]);
+  return { orderRows, attemptRows, perOrderRows, durationUnit: configuredUnit() };
 }
 
 export async function facets(clientKey) {
