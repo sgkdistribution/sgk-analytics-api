@@ -17,6 +17,7 @@
 // now the actual column names, so nothing needs setting for it to work.
 // ---------------------------------------------------------------------------
 import { query } from './db.js';
+import { avgSecondsExpr, columnTypes, configuredUnit } from './durations.js';
 
 const env = (k, fallback) => (process.env[k] || fallback);
 
@@ -40,7 +41,12 @@ export const SCHEMA = {
   o_completeFlag: env('SQL_ORDERS_COMPLETE_FLAG', 'OrderStatusCompleteFlag'),
   o_date:        env('SQL_ORDERS_DATE_COL', 'OrderDate'),
   o_statusName:  env('SQL_ORDERS_STATUS_COL', 'OrderStatusName'),
-  // The three durations the WMS has already worked out for us, in days.
+  // The three durations the WMS has already worked out for us.
+  //
+  // NOT IN DAYS — that was an unchecked assumption written when this schema was
+  // first read, and it is what put "384,329.26 days" on a client's dashboard.
+  // The unit is worked out at runtime in durations.js from the column's real
+  // type; see the long note at the top of that file.
   o_confToBook:  env('SQL_ORDERS_CONF_TO_BOOK', 'OrderTimeConfToBook'),
   o_bookToDone:  env('SQL_ORDERS_BOOK_TO_DONE', 'OrderTimeBookToCompleted'),
   o_confToDone:  env('SQL_ORDERS_CONF_TO_DONE', 'OrderTimeConfToCompleted'),
@@ -165,6 +171,10 @@ function attemptFilter(f) {
 
 export async function orderTotals(f) {
   const { where, params } = orderFilter(f);
+  // The three duration columns come back as SECONDS whatever they are stored as.
+  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
+  const dur = (col) => avgSecondsExpr(t[col], ident(col));
+
   const rows = await query(`
     SELECT
       SUM(${ident(SCHEMA.o_value)})             AS totalSales,
@@ -173,16 +183,42 @@ export async function orderTotals(f) {
       AVG(${ident(SCHEMA.o_weight)})            AS avgWeightKg,
       AVG(${ident(SCHEMA.o_cube)})              AS avgCubeM3,
       AVG(${ident(SCHEMA.o_items)})             AS avgItemsPerOrder,
-      AVG(${ident(SCHEMA.o_confToBook)})        AS avgReceivedToProposedDays,
-      AVG(${ident(SCHEMA.o_bookToDone)})        AS avgReceivedToDeliveredDays,
-      AVG(${ident(SCHEMA.o_confToDone)})        AS avgCreatedToDeliveredDays,
+      ${dur(SCHEMA.o_confToBook)}               AS avgReceivedToProposedSec,
+      ${dur(SCHEMA.o_bookToDone)}               AS avgReceivedToDeliveredSec,
+      ${dur(SCHEMA.o_confToDone)}               AS avgConfToCompletedSec,
+      -- the RAW averages, untouched, so the diagnostic can show what the column
+      -- actually holds rather than what we decided it holds
+      AVG(${ident(SCHEMA.o_confToBook)})        AS rawConfToBook,
+      AVG(${ident(SCHEMA.o_bookToDone)})        AS rawBookToDone,
+      AVG(${ident(SCHEMA.o_confToDone)})        AS rawConfToDone,
       -- proposals the customer accepted first time round
       SUM(COALESCE(${ident(SCHEMA.o_bookReqFlag)}, 0))  AS bookingsRequested,
       SUM(COALESCE(${ident(SCHEMA.o_bookConfFlag)}, 0)) AS bookingsConfirmed
     FROM ${ident(SCHEMA.orders)}
     ${where}
   `, params);
-  return rows[0] || {};
+  return { ...(rows[0] || {}), _durationUnit: configuredUnit(), _columnTypes: t };
+}
+
+/**
+ * Raw duration figures for /analytics/diag/durations — column types plus MIN,
+ * AVG and MAX untouched, so the unit can be settled by looking rather than by
+ * anyone guessing again.
+ */
+export async function durationDiagnostics(f) {
+  const { where, params } = orderFilter(f);
+  const cols = [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone];
+  const t = await columnTypes(SCHEMA.orders, cols);
+  const rows = await query(`
+    SELECT
+      COUNT(*) AS rows_considered,
+      MIN(${ident(SCHEMA.o_confToBook)}) AS minConfToBook, AVG(${ident(SCHEMA.o_confToBook)}) AS avgConfToBook, MAX(${ident(SCHEMA.o_confToBook)}) AS maxConfToBook,
+      MIN(${ident(SCHEMA.o_bookToDone)}) AS minBookToDone, AVG(${ident(SCHEMA.o_bookToDone)}) AS avgBookToDone, MAX(${ident(SCHEMA.o_bookToDone)}) AS maxBookToDone,
+      MIN(${ident(SCHEMA.o_confToDone)}) AS minConfToDone, AVG(${ident(SCHEMA.o_confToDone)}) AS avgConfToDone, MAX(${ident(SCHEMA.o_confToDone)}) AS maxConfToDone
+    FROM ${ident(SCHEMA.orders)}
+    ${where}
+  `, params);
+  return { columnTypes: t, unitInUse: configuredUnit(), raw: rows[0] || {} };
 }
 
 // Split of orders across the PartnerName values this company owns — the pie on
@@ -256,6 +292,8 @@ export async function noAttemptCount(f) {
 
 export async function byMonth(f) {
   const { where, params, date } = orderFilter(f);
+  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
+  const dur = (col) => avgSecondsExpr(t[col], ident(col));
   return query(`
     SELECT
       YEAR(${date}) AS y, MONTH(${date}) AS m,
@@ -264,9 +302,9 @@ export async function byMonth(f) {
       AVG(${ident(SCHEMA.o_weight)})        AS avgWeightKg,
       AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3,
       AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder,
-      AVG(${ident(SCHEMA.o_confToDone)})    AS avgConfToCompletedDays,
-      AVG(${ident(SCHEMA.o_bookToDone)})    AS avgReceivedToDeliveredDays,
-      AVG(${ident(SCHEMA.o_confToBook)})    AS avgReceivedToProposedDays
+      ${dur(SCHEMA.o_confToDone)}           AS avgConfToCompletedSec,
+      ${dur(SCHEMA.o_bookToDone)}           AS avgReceivedToDeliveredSec,
+      ${dur(SCHEMA.o_confToBook)}           AS avgReceivedToProposedSec
     FROM ${ident(SCHEMA.orders)}
     ${where}
     GROUP BY YEAR(${date}), MONTH(${date})

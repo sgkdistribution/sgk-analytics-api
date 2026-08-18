@@ -17,6 +17,7 @@ import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.
 import { sqlConfigured, ping } from './db.js';
 import * as Q from './queries.js';
 import { demoFor, demoEnabled } from './demo.js';
+import { secondsToDays, secondsToHours, humanDuration, interpretations, configuredUnit } from './durations.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -173,6 +174,40 @@ app.get('/analytics/partners', async (req, res) => {
   }
 });
 
+// DURATION DIAGNOSTIC — SGK staff only.
+//
+// Shows the three duration columns' real types alongside their raw MIN/AVG/MAX
+// and what each average would mean if the column were seconds, minutes, hours,
+// days, or HHMMSS digits from a TIME column. Exactly one of those readings is a
+// believable delivery time, and that settles the unit by looking rather than by
+// anybody guessing a second time.
+app.get('/analytics/diag/durations', async (req, res) => {
+  try {
+    const identity = await verifyToken(req.headers.authorization);
+    if (!isSgk(identity)) return res.status(403).json({ error: 'SGK staff only.' });
+    if (!sqlConfigured()) return res.status(503).json({ error: 'The analytics database is not connected yet.' });
+    const { company } = resolveCompany(identity, { companyId: req.query.company, companyName: req.query.companyName });
+    if (!company) return res.json({ needsCompany: true, companies: listCompanies() });
+
+    const d = await Q.durationDiagnostics({
+      clientKey: company.sqlKey,
+      year: req.query.year ? Number(req.query.year) : null,
+    });
+    res.json({
+      company: { id: company.companyId, name: company.name },
+      columnTypes: d.columnTypes,
+      unitInUse: d.unitInUse,
+      rowsConsidered: Number(d.raw.rows_considered || 0),
+      confToBook:  { min: d.raw.minConfToBook, max: d.raw.maxConfToBook, ...interpretations(d.raw.avgConfToBook) },
+      bookToDone:  { min: d.raw.minBookToDone, max: d.raw.maxBookToDone, ...interpretations(d.raw.avgBookToDone) },
+      confToDone:  { min: d.raw.minConfToDone, max: d.raw.maxConfToDone, ...interpretations(d.raw.avgConfToDone) },
+      howToRead: 'Pick the line that gives a believable delivery time. If that is not "ifSeconds", set SQL_DURATION_UNIT in /etc/sgk-analytics.env and restart.',
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
 // Which companies SGK staff may switch between (the ones with a key configured).
 app.get('/analytics/companies', async (req, res) => {
   try {
@@ -261,9 +296,9 @@ app.get('/analytics/overview', async (req, res) => {
           unknown: Number(a.unknown || 0),
           successRatio: pct(Number(a.successful || 0), total),
           firstTimeRatio: null,
-          avgConfToCompletedDays: num(r.avgConfToCompletedDays),
-          avgReceivedToDeliveredDays: num(r.avgReceivedToDeliveredDays),
-          avgReceivedToProposedDays: num(r.avgReceivedToProposedDays),
+          avgConfToCompletedDays: secondsToDays(r.avgConfToCompletedSec),
+          avgReceivedToDeliveredDays: secondsToDays(r.avgReceivedToDeliveredSec),
+          avgReceivedToProposedDays: secondsToDays(r.avgReceivedToProposedSec),
           trendSuccessful: Number(a.successful || 0),
           trendFailed: Number(a.failed || 0),
           trendNoAttempt: Number(a.unknown || 0),
@@ -296,10 +331,29 @@ app.get('/analytics/overview', async (req, res) => {
           avgWeightKg: num(totals.avgWeightKg),
           avgCubeM3: num(totals.avgCubeM3),
           avgItemsPerOrder: num(totals.avgItemsPerOrder),
-          avgReceivedToProposedDays: num(totals.avgReceivedToProposedDays),
-          avgReceivedToDeliveredDays: num(totals.avgReceivedToDeliveredDays),
-          avgCreatedToDeliveredDays: num(totals.avgCreatedToDeliveredDays),
-          avgConfToCompletedDays: num(totals.avgCreatedToDeliveredDays),
+          // DURATIONS. Two things were wrong here.
+          //
+          // 1. The unit. These came straight out of SQL and were labelled "days"
+          //    on an assumption nobody checked — hence "384,329.26 days", which
+          //    is a thousand years. They are now seconds by the time they reach
+          //    this line, converted from whatever the column actually stores.
+          //
+          // 2. THE LAST LINE READ THE WRONG FIELD. avgConfToCompleted was fed
+          //    avgCreatedToDelivered, so two tiles showed one number twice and
+          //    it looked like a coincidence rather than a bug.
+          //
+          // Days and hours are both sent: "0.06 days" tells a reader nothing,
+          // and the page picks whichever suits the size.
+          avgReceivedToProposedDays: secondsToDays(totals.avgReceivedToProposedSec),
+          avgReceivedToDeliveredDays: secondsToDays(totals.avgReceivedToDeliveredSec),
+          avgCreatedToDeliveredDays: secondsToDays(totals.avgConfToCompletedSec),
+          avgConfToCompletedDays: secondsToDays(totals.avgConfToCompletedSec),
+          avgReceivedToProposedHours: secondsToHours(totals.avgReceivedToProposedSec),
+          avgReceivedToDeliveredHours: secondsToHours(totals.avgReceivedToDeliveredSec),
+          avgConfToCompletedHours: secondsToHours(totals.avgConfToCompletedSec),
+          avgReceivedToProposedText: humanDuration(totals.avgReceivedToProposedSec),
+          avgReceivedToDeliveredText: humanDuration(totals.avgReceivedToDeliveredSec),
+          avgConfToCompletedText: humanDuration(totals.avgConfToCompletedSec),
           firstTimeSuccessOrders: ftsOrders,
           firstTimeSuccessRatio: pct(ftsOrders, scopedOrders),
           firstTimeProposalAcceptance: pct(Number(totals.bookingsConfirmed || 0), Number(totals.bookingsRequested || 0)),
@@ -334,6 +388,9 @@ app.get('/analytics/overview', async (req, res) => {
       company: { id: company.companyId, name: company.name },
       staff,
       filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
+      // Says out loud how the duration columns were read. An assumption on screen
+      // gets questioned; an assumption in a comment does not.
+      durationUnit: configuredUnit(),
       generatedAt: new Date().toISOString(),
       ...data,
     });
