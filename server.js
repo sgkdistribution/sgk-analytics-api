@@ -303,6 +303,11 @@ app.get('/analytics/overview', async (req, res) => {
       }), { noAttempt: 0, firstTime: 0, scopedOrders: 0 });
 
     const attemptByKey = new Map(roll.attemptRows.map((r) => [`${r.y}-${r.m}`, r]));
+    // Per-month first-time-success. This used to be hard-coded to null, so the
+    // "first time %" line on the orders chart was pinned flat to 0% — which does
+    // not read as "no data", it reads as "we never get it right first time".
+    // The rollup already carries the numbers per month, so it can be real.
+    const perOrderByKey = new Map(roll.perOrderRows.map((r) => [`${r.y}-${r.m}`, r]));
     const byMonth = monthTotals(rows).map((b) => {
       const a = attemptByKey.get(`${b.y}-${b.m}`) || {};
       const total = Number(a.total || 0);
@@ -318,7 +323,10 @@ app.get('/analytics/overview', async (req, res) => {
         failed: Number(a.failed || 0),
         unknown: Number(a.outstanding || 0),
         successRatio: pct(Number(a.successful || 0), total),
-        firstTimeRatio: null,
+        firstTimeRatio: (() => {
+          const po = perOrderByKey.get(`${b.y}-${b.m}`);
+          return po ? pct(Number(po.firstTime || 0), Number(po.scopedOrders || 0)) : null;
+        })(),
         avgConfToCompletedDays: secondsToDays(meanOf(b.confToDoneSum, b.confToDoneCnt)),
         avgReceivedToDeliveredDays: secondsToDays(meanOf(b.bookToDoneSum, b.bookToDoneCnt)),
         avgReceivedToProposedDays: secondsToDays(meanOf(b.confToBookSum, b.confToBookCnt)),
