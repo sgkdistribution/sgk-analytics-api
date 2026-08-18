@@ -86,6 +86,53 @@ function excludeClause(alias, params) {
   return ` AND ${p}${ident(SCHEMA.o_statusName)} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')})`;
 }
 
+// ---------------------------------------------------------------------------
+// DATE FILTERING — the single biggest thing that made this service slow.
+//
+// It used to say `YEAR(OrderDate) = :year AND MONTH(OrderDate) = :month`. That
+// reads naturally and it is a disaster for performance: wrapping the column in a
+// function makes the condition NON-SARGABLE, so MySQL cannot use an index on the
+// date at all. It has to read every row in the table and evaluate YEAR() on each
+// one. On an extract this size that is the twenty-plus seconds that produced
+// "Query inactivity timeout" on the dashboard.
+//
+// The same filter as a HALF-OPEN RANGE — `>= '2026-01-01' AND < '2027-01-01'` —
+// means exactly the same thing and CAN use an index.
+//
+// Half-open (< the first day of the next period) rather than BETWEEN, because
+// BETWEEN on a DATETIME silently drops everything after 00:00:00 on the last day.
+// ---------------------------------------------------------------------------
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function yearMonthRange(year, month) {
+  const y = Number(year);
+  if (!y) return null;
+  const m = Number(month);
+  if (m >= 1 && m <= 12) {
+    const ny = m === 12 ? y + 1 : y;
+    const nm = m === 12 ? 1 : m + 1;
+    return { start: `${y}-${pad2(m)}-01`, end: `${ny}-${pad2(nm)}-01` };
+  }
+  return { start: `${y}-01-01`, end: `${y + 1}-01-01` };
+}
+
+/** Shared by both filters so orders and stops can never drift apart. */
+function pushDateConds(conds, params, d, f) {
+  const range = yearMonthRange(f.year, f.month);
+  if (range) {
+    conds.push(`${d} >= :rangeStart AND ${d} < :rangeEnd`);
+    params.rangeStart = range.start;
+    params.rangeEnd = range.end;
+  } else if (f.month) {
+    // A month with no year genuinely does mean "that month in any year", and
+    // there is no range that expresses it. Rare, and the UI always sends a year.
+    conds.push(`MONTH(${d}) = :month`);
+    params.month = Number(f.month);
+  }
+  if (f.from) { conds.push(`${d} >= :fromDate`); params.fromDate = f.from; }
+  if (f.to)   { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
+}
+
 function orderFilter(f, alias = '') {
   const p = alias ? `${alias}.` : '';
   const d = oDate(alias);
@@ -93,10 +140,7 @@ function orderFilter(f, alias = '') {
   const conds = [`${p}${ident(SCHEMA.o_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
 
-  if (f.year)  { conds.push(`YEAR(${d}) = :year`);   params.year = Number(f.year); }
-  if (f.month) { conds.push(`MONTH(${d}) = :month`); params.month = Number(f.month); }
-  if (f.from)  { conds.push(`${d} >= :fromDate`);    params.fromDate = f.from; }
-  if (f.to)    { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
+  pushDateConds(conds, params, d, f);
   if (f.service) { conds.push(`${p}${ident(SCHEMA.o_service)} = :service`); params.service = String(f.service); }
 
   return { where: `WHERE ${conds.join(' AND ')}${excludeClause(alias, params)}`, params, date: d };
@@ -109,10 +153,7 @@ function attemptFilter(f) {
   const conds = [`a.${ident(SCHEMA.a_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
 
-  if (f.year)  { conds.push(`YEAR(${d}) = :year`);   params.year = Number(f.year); }
-  if (f.month) { conds.push(`MONTH(${d}) = :month`); params.month = Number(f.month); }
-  if (f.from)  { conds.push(`${d} >= :fromDate`);    params.fromDate = f.from; }
-  if (f.to)    { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
+  pushDateConds(conds, params, d, f);
   if (f.service) { conds.push(`a.\`ServiceLevelName\` = :service`); params.service = String(f.service); }
 
   return { where: `WHERE ${conds.join(' AND ')}`, params, date: d };
@@ -158,11 +199,15 @@ export async function byPartner(f) {
 }
 
 // First time right: the order took exactly one visit, and that visit completed.
+// NOTE: this no longer recomputes the order count. It used to carry a correlated
+// `(SELECT COUNT(*) FROM orders o <where>)` in the select list — a second full
+// pass over the same rows orderTotals had already counted, for a number the
+// caller was holding anyway. OrderID is the primary key, so COUNT(*) and
+// COUNT(DISTINCT OrderID) are the same figure; the server now uses totalOrders.
 export async function firstTimeSuccess(f) {
   const { where, params } = orderFilter(f, 'o');
   const rows = await query(`
     SELECT
-      (SELECT COUNT(*) FROM ${ident(SCHEMA.orders)} o ${where}) AS scopedOrders,
       SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END) AS firstTimeSuccessOrders
     FROM (
       SELECT a.${ident(SCHEMA.a_order)} AS OrderID,

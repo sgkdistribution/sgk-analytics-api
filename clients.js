@@ -64,7 +64,46 @@ export function clientMap() {
       domains: (c.domains || []).map((d) => String(d).toLowerCase().replace(/^@/, '')),
       emails: (c.emails || []).map((e) => String(e).toLowerCase()),
     }));
+  warnAboutOverlaps(cache);
   return cache;
+}
+
+/**
+ * Shout if two companies claim the same email or domain.
+ *
+ * THIS IS NOT THEORETICAL. There are now two Roseland entries — the real account
+ * and a testing one — and a client is matched by exact email first, then by
+ * DOMAIN. If both entries list roselandfurniture.com, whichever appears first in
+ * CLIENT_MAP silently wins every lookup, and the real client could end up looking
+ * at the testing company's dashboard (or the reverse) with nothing on screen to
+ * say so. Two companies whose names differ by one word is exactly the situation
+ * where that goes unnoticed.
+ *
+ * Warn rather than throw: refusing to start would take every OTHER company's
+ * dashboard down over one duplicated line.
+ */
+function warnAboutOverlaps(list) {
+  const seenEmail = new Map();
+  const seenDomain = new Map();
+  for (const c of list) {
+    for (const e of c.emails) {
+      if (seenEmail.has(e)) {
+        console.warn(`[clients] "${e}" is listed under BOTH "${seenEmail.get(e)}" and "${c.name}" — `
+          + `the first one wins and the second will never match. Remove the duplicate.`);
+      } else seenEmail.set(e, c.name);
+    }
+    for (const d of c.domains) {
+      if (seenDomain.has(d)) {
+        console.warn(`[clients] domain "${d}" is listed under BOTH "${seenDomain.get(d)}" and "${c.name}" — `
+          + `every user on that domain resolves to "${seenDomain.get(d)}". If these are separate accounts `
+          + `(a live one and a testing one, say), give them different domains or match on exact emails.`);
+      } else seenDomain.set(d, c.name);
+    }
+    if (!c.emails.length && !c.domains.length) {
+      console.warn(`[clients] "${c.name}" has no emails and no domains — no client will ever resolve to it. `
+        + `SGK staff can still reach it with ?company=.`);
+    }
+  }
 }
 
 export function isSgk({ email, groups }) {

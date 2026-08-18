@@ -90,7 +90,16 @@ export function getPool() {
     // The connection crosses the public internet, so it is encrypted, and with
     // the Cloud SQL client certificates it is mutually authenticated too.
     ssl: sslOptions(),
-    connectionLimit: Number(process.env.SQL_POOL_MAX || 6),
+    // The overview fires nine reads at once. A pool of six meant three of them
+    // queued behind the others before they even started, on top of already being
+    // slow — so the dashboard paid for two rounds instead of one.
+    connectionLimit: Number(process.env.SQL_POOL_MAX || 12),
+    // Cloud SQL closes idle connections. Without this the pool hands out a
+    // socket the server has already dropped and the first query on it fails.
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    maxIdle: Number(process.env.SQL_POOL_IDLE || 4),
+    idleTimeout: 60000,
     waitForConnections: true,
     connectTimeout: 15000,
     namedPlaceholders: true,        // lets queries use :name instead of ?
@@ -105,13 +114,48 @@ export function getPool() {
   return pool;
 }
 
+const TIMEOUT_MS = () => Number(process.env.SQL_TIMEOUT_MS || 25000);
+
 // Run a parameterised read. params is a plain object: { year: 2026, clientKey: 'RSL' }.
+//
+// TWO TIMEOUTS, AND THE ORDER MATTERS.
+//
+//   MAX_EXECUTION_TIME (server side) is the one that should fire. MySQL cancels
+//   the statement itself, the connection stays healthy and goes back to the pool.
+//
+//   mysql2's own `timeout` option is the backstop, deliberately set LATER. When
+//   it fires it does not cancel anything — it destroys the socket while the query
+//   carries on running on the server, so the pool loses a connection AND the
+//   database keeps doing the work. It also produces the message "Query inactivity
+//   timeout", which says nothing about what actually happened; that was the error
+//   on the dashboard and it sent us looking at the network rather than the query.
+//
+// So: let the server cancel cleanly, and only fall back to the destructive path
+// if the server ignored us (MAX_EXECUTION_TIME needs MySQL 5.7.8+ and only
+// applies to read-only SELECTs).
 export async function query(text, params = {}) {
+  const ms = TIMEOUT_MS();
   const conn = await getPool().getConnection();
+  const started = Date.now();
   try {
-    await conn.query({ sql: `SET SESSION MAX_EXECUTION_TIME=${Number(process.env.SQL_TIMEOUT_MS || 20000)}` }).catch(() => {});
-    const [rows] = await conn.query({ sql: text, timeout: Number(process.env.SQL_TIMEOUT_MS || 20000) }, params);
+    await conn.query({ sql: `SET SESSION MAX_EXECUTION_TIME=${ms}` }).catch(() => {});
+    const [rows] = await conn.query({ sql: text, timeout: ms + 5000 }, params);
     return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    const code = e?.code || '';
+    const timedOut = code === 'PROTOCOL_SEQUENCE_TIMEOUT'
+      || code === 'ER_QUERY_TIMEOUT'
+      || /timeout/i.test(e?.message || '');
+    if (timedOut) {
+      // Say which query and how long, so the next person does not have to guess.
+      const first = String(text).trim().split('\n')[0].slice(0, 90);
+      console.error(`[db] query timed out after ${Date.now() - started}ms: ${first}…`);
+      throw Object.assign(
+        new Error('The warehouse database took too long to answer. The figures could not be loaded — try a narrower date range, or try again shortly.'),
+        { status: 504, cause: e },
+      );
+    }
+    throw e;
   } finally {
     conn.release();
   }

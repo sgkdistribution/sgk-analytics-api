@@ -37,17 +37,96 @@ app.use((req, res, next) => {
   next();
 });
 
-// A short shared cache. Twelve people watching the same dashboard should not be
-// twelve times the load on the warehouse database.
-const TTL = Number(process.env.CACHE_TTL_MS || 45000);
+// ---------------------------------------------------------------------------
+// CACHE — fresh, then stale-while-revalidate, with in-flight de-duplication.
+//
+// A dashboard built from nine reads over a warehouse extract is never going to
+// be instant on a cold cache. What it CAN be is instant every time after that,
+// and it can stop several people arriving at once from each triggering their own
+// full rebuild.
+//
+// THREE BEHAVIOURS, in order:
+//
+//   FRESH   (< TTL)        -> return it, do nothing else.
+//   STALE   (< STALE_MAX)  -> RETURN IT IMMEDIATELY and refresh in the
+//                             background. The person gets figures now, slightly
+//                             behind, and the next visitor gets the new ones. A
+//                             45-second TTL on a 20-second query meant almost
+//                             every visitor waited for a rebuild.
+//   MISSING / too old      -> build it, and make everyone else asking for the
+//                             same key wait on that ONE build rather than
+//                             starting their own.
+//
+// The last part matters most on a slow database: without it, five people opening
+// the dashboard together used to run five identical 20-second queries, each
+// making the others slower.
+//
+// Keys already include the company's sqlKey (see `f` below), so nothing here can
+// serve one company's figures to another.
+// ---------------------------------------------------------------------------
+const TTL = Number(process.env.CACHE_TTL_MS || 120000);
+const STALE_MAX = Number(process.env.CACHE_STALE_MS || 900000);   // 15 minutes
 const cache = new Map();
+const inFlight = new Map();
+
+function evictIfLarge() {
+  if (cache.size <= 300) return;
+  // Oldest first, not insertion order — the oldest entries are the ones least
+  // likely to be wanted again.
+  const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 100);
+  for (const [k] of oldest) cache.delete(k);
+}
+
+function build(key, fn) {
+  const running = inFlight.get(key);
+  if (running) return running;
+  const p = (async () => {
+    try {
+      const value = await fn();
+      cache.set(key, { at: Date.now(), value });
+      evictIfLarge();
+      return value;
+    } finally {
+      inFlight.delete(key);
+    }
+  })();
+  inFlight.set(key, p);
+  return p;
+}
+
+/**
+ * For things that barely change — the Year and Service Level dropdowns.
+ *
+ * Its own long TTL so a filter change never rebuilds them, and it still serves
+ * the old list while refreshing rather than making anyone wait for a DISTINCT
+ * scan over a client's whole history.
+ */
+const LONG_TTL = Number(process.env.CACHE_FACETS_MS || 3600000);   // 1 hour
+async function cachedLong(key, fn) {
+  const hit = cache.get(key);
+  const age = hit ? Date.now() - hit.at : Infinity;
+  if (hit && age < LONG_TTL) return hit.value;
+  if (hit) {
+    build(key, fn).catch((e) => console.warn('[analytics] facet refresh failed:', e?.message || e));
+    return hit.value;
+  }
+  return build(key, fn);
+}
+
 const cached = async (key, fn) => {
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < TTL) return hit.value;
-  const value = await fn();
-  cache.set(key, { at: Date.now(), value });
-  if (cache.size > 300) for (const k of [...cache.keys()].slice(0, 100)) cache.delete(k);
-  return value;
+  const age = hit ? Date.now() - hit.at : Infinity;
+
+  if (hit && age < TTL) return hit.value;
+
+  if (hit && age < STALE_MAX) {
+    // Serve now, refresh behind. The catch matters: an unhandled rejection here
+    // would take the process down for a refresh nobody was waiting on.
+    build(key, fn).catch((e) => console.warn('[analytics] background refresh failed:', e?.message || e));
+    return hit.value;
+  }
+
+  return build(key, fn);
 };
 
 const num = (v) => (v === null || v === undefined ? null : Number(Number(v).toFixed(2)));
@@ -153,10 +232,18 @@ app.get('/analytics/overview', async (req, res) => {
 
     const key = JSON.stringify(f);
 
+    // FACETS ARE CACHED SEPARATELY AND FOR MUCH LONGER. They are the Year and
+    // Service Level dropdowns — they do not depend on the filters at all, yet
+    // they were inside the per-filter cache, so changing the year re-ran two
+    // DISTINCT scans over the whole client's history to rebuild a list that had
+    // not changed. Keyed by the company's sqlKey, so it is still per company.
+    const facetsKey = `facets:${JSON.stringify(company.sqlKey)}`;
+    const facetsPromise = cachedLong(facetsKey, () => Q.facets(company.sqlKey));
+
     const data = await cached(key, async () => {
       const [totals, firstTime, attempts, noAttempt, months, attemptMonths, weeks, facets, partners] = await Promise.all([
         Q.orderTotals(f), Q.firstTimeSuccess(f), Q.attemptTotals(f), Q.noAttemptCount(f),
-        Q.byMonth(f), Q.attemptsByMonth(f), Q.byWeek(f), Q.facets(company.sqlKey), Q.byPartner(f),
+        Q.byMonth(f), Q.attemptsByMonth(f), Q.byWeek(f), facetsPromise, Q.byPartner(f),
       ]);
 
       const attemptByKey = new Map(attemptMonths.map((r) => [`${r.y}-${r.m}`, r]));
@@ -196,7 +283,9 @@ app.get('/analytics/overview', async (req, res) => {
       });
 
       const totalAttempts = Number(attempts.total || 0);
-      const scopedOrders = Number(firstTime.scopedOrders || totals.totalOrders || 0);
+      // Was a second COUNT(*) inside firstTimeSuccess; OrderID is the primary key
+      // so this is the same number for one less pass over the table.
+      const scopedOrders = Number(totals.totalOrders || 0);
       const ftsOrders = Number(firstTime.firstTimeSuccessOrders || 0);
 
       return {
