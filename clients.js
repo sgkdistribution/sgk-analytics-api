@@ -100,8 +100,11 @@ function warnAboutOverlaps(list) {
       } else seenDomain.set(d, c.name);
     }
     if (!c.emails.length && !c.domains.length) {
-      console.warn(`[clients] "${c.name}" has no emails and no domains — no client will ever resolve to it. `
-        + `SGK staff can still reach it with ?company=.`);
+      // NOT necessarily dead any more: a client whose Cognito group matches this
+      // entry's companyId resolves without either list. Still worth saying, since
+      // it is a fair bet when an entry looks unreachable.
+      console.warn(`[clients] "${c.name}" has no emails and no domains — it can only be reached by `
+        + `Cognito group (companyId "${c.companyId}") or by SGK with ?company=.`);
     }
   }
 }
@@ -115,6 +118,61 @@ export function isSgk({ email, groups }) {
 }
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// ---------------------------------------------------------------------------
+// WHO A CLIENT IS — FROM THEIR COGNITO GROUP, NOT THEIR EMAIL ADDRESS.
+//
+// Matching on email domain works right up until a client invites somebody on a
+// personal address — a gmail, an outlook — and then their dashboard says "no
+// dashboard is configured for this account". The answer can never be to add
+// outlook.com to the map: that would hand every Outlook user on earth somebody's
+// sales figures.
+//
+// The portal already knows the answer and puts it in the token. Every client user
+// carries a Cognito group `company_<companyId>`, stamped by the post-confirmation
+// trigger and used by AppSync to decide which rows they may read at all. It is
+// issued by Cognito, cannot be spoofed by the browser, and is the SAME id the
+// portal writes on every record.
+//
+// So a client is resolved by group first, and email/domain is kept only as a
+// fallback for anything the group cannot answer.
+// ---------------------------------------------------------------------------
+
+/** The company ids carried on a token: ['company_bedroomking-mrup3q…'] -> ['bedroomking-mrup3q…']. */
+function groupCompanyIds(groups) {
+  return (groups || [])
+    .filter((g) => typeof g === 'string' && g.startsWith('company_'))
+    .map((g) => g.slice('company_'.length))
+    .filter(Boolean);
+}
+
+/**
+ * The SLUG half of a portal company id.
+ *
+ * The portal builds ids as `<slug>-<uid>`, where the slug is the company name
+ * lowercased with every non-alphanumeric stripped, and the uid is base36 with no
+ * dashes. So everything before the FIRST dash is exactly the slug.
+ */
+const idSlug = (id) => String(id || '').split('-')[0];
+
+/**
+ * Match a token's groups against a CLIENT_MAP entry.
+ *
+ *   1. EXACT companyId. Correct, and what a properly filled-in map gives you.
+ *   2. The slug, against the entry's companyId or its NAME.
+ *
+ * Rule 2 exists because CLIENT_MAP entries predate this and carry short handles
+ * ("roseland", "bedroomking") rather than the portal's full id. Comparing the
+ * slug to the normalised NAME simply reverses how the portal built the id in the
+ * first place, so those entries keep working with no config change — and setting
+ * the real companyId makes rule 1 hit first and rule 2 irrelevant.
+ */
+function matchesGroups(entry, groupIds) {
+  if (!groupIds.length) return false;
+  if (groupIds.includes(entry.companyId)) return true;
+  const wanted = new Set([norm(entry.companyId).slice(0, 24), norm(entry.name).slice(0, 24)]);
+  return groupIds.some((g) => wanted.has(idSlug(g)));
+}
 
 // The ONLY way a company is chosen. Clients get theirs; SGK may ask for one.
 export function resolveCompany(identity, requested = {}) {
@@ -140,11 +198,24 @@ export function resolveCompany(identity, requested = {}) {
 
   // A client. The request does not get a say in which company this is.
   const domain = identity.email.split('@')[1] || '';
-  const hit = map.find((c) => c.emails.includes(identity.email))
+  const groupIds = groupCompanyIds(identity.groups);
+
+  // GROUP FIRST. It is the only signal that is right for every colleague a
+  // client will ever invite, whatever address they use.
+  const hit = map.find((c) => matchesGroups(c, groupIds))
+    || map.find((c) => c.emails.includes(identity.email))
     || map.find((c) => c.domains.includes(domain));
+
   if (!hit) {
+    // Say what was actually looked for. "nothing covers outlook.com" sent people
+    // off to add a public email domain to the map, which would have been a leak.
+    const seen = groupIds.length ? groupIds.join(', ') : '(none on the token)';
     throw Object.assign(
-      new Error(`No dashboard is configured for this account yet — nothing in CLIENT_MAP covers "${domain}". Add that domain to the right company.`),
+      new Error(
+        'No dashboard is configured for this account yet. '
+        + `Company group on the token: ${seen}. Set that as the companyId on the right CLIENT_MAP entry `
+        + `(or add ${identity.email} to its emails). Do NOT add "${domain}" as a domain if it is a public one.`,
+      ),
       { status: 403 },
     );
   }
@@ -161,11 +232,20 @@ export function describeAccess(identity) {
   const staff = isSgk(identity);
   const domain = identity.email.split('@')[1] || '';
   const map = clientMap();
-  const match = map.find((c) => c.emails.includes(identity.email))
+  const groupIds = groupCompanyIds(identity.groups);
+  const match = map.find((c) => matchesGroups(c, groupIds))
+    || map.find((c) => c.emails.includes(identity.email))
     || map.find((c) => c.domains.includes(domain));
   return {
     email: identity.email,
     domain,
+    // The groups are the thing to look at first when a dashboard says no.
+    groups: identity.groups || [],
+    companyGroups: groupIds,
+    matchedBy: match
+      ? (matchesGroups(match, groupIds) ? 'cognito group'
+        : match.emails.includes(identity.email) ? 'email' : 'domain')
+      : null,
     treatedAs: staff ? 'SGK staff' : 'client',
     matched: match ? { companyId: match.companyId, name: match.name, sqlKey: match.sqlKey } : null,
     // Staff see the whole map; a client only ever sees their own entry.
