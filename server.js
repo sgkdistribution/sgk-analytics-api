@@ -15,6 +15,7 @@ import express from 'express';
 import { verifyToken, authConfigured } from './auth.js';
 import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.js';
 import { sqlConfigured, ping } from './db.js';
+import { resolveSchema, schemaReport, forgetSchema } from './schema.js';
 import * as Q from './queries.js';
 import { demoFor, demoEnabled } from './demo.js';
 import { secondsToDays, secondsToHours, humanDuration, interpretations, configuredUnit } from './durations.js';
@@ -131,6 +132,15 @@ const cached = async (key, fn) => {
   return build(key, fn);
 };
 
+/**
+ * Does this error mean "the table is not the shape I was told it was"?
+ *
+ * MySQL is specific about it, so this matches on the CODES rather than on the
+ * wording of a message that changes between versions and locales.
+ */
+const isSchemaDrift = (e) => ['ER_BAD_FIELD_ERROR', 'ER_NO_SUCH_TABLE', 'ER_UNKNOWN_TABLE', 'ER_WRONG_TABLE_NAME']
+  .includes(e?.code || e?.cause?.code || '');
+
 const num = (v) => (v === null || v === undefined ? null : Number(Number(v).toFixed(2)));
 const pct = (part, whole) => (whole ? Number(((part / whole) * 100).toFixed(2)) : null);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -138,12 +148,21 @@ const ddMon = (d) => `${String(d.getUTCDate()).padStart(2, '0')} ${MONTHS[d.getU
 
 app.get('/health', async (_req, res) => {
   let db = 'not configured';
+  // WHICH TABLE AND WHICH COLUMNS IS IT ACTUALLY USING. The names are resolved
+  // against the live database rather than assumed, so "the extract changed and
+  // the dashboard broke" is answered by reading this instead of by guesswork:
+  // it names the table it found, every column whose name has moved, and every
+  // column it could not find at all (those show a dash on the dashboard).
+  let schema = 'not checked — the database is not configured';
   if (sqlConfigured()) {
     try { await ping(); db = 'connected'; } catch (e) { db = `error: ${e?.message || e}`; }
+    try { await resolveSchema(); } catch { /* the report below carries the reason */ }
+    schema = schemaReport();
   }
   res.json({
     ok: true,
     db,
+    schema,
     auth: authConfigured() ? 'configured' : 'not configured',
     clients: listCompanies().length,
     ...(demoEnabled() ? { demo: 'ON — serving frozen sample data, not live figures' } : {}),
@@ -281,7 +300,32 @@ app.get('/analytics/overview', async (req, res) => {
     const yearKey = JSON.stringify({ clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service });
 
     const facetsKey = `facets:${JSON.stringify(company.sqlKey)}`;
-    const facetsPromise = cachedLong(facetsKey, () => Q.facets(company.sqlKey));
+    // -----------------------------------------------------------------------
+    // THE .catch() BELOW IS NOT TIDINESS. It is the reason the dashboard used to
+    // say "Failed to fetch" instead of saying what was actually wrong.
+    //
+    // This promise is STARTED here and AWAITED six lines further down. If the
+    // rollup in between throws first — which is exactly what a renamed column in
+    // the extract does — the await is never reached, this rejection never gets a
+    // handler, and Node treats an unhandled rejection as fatal: THE PROCESS
+    // EXITS. systemd restarts it (Restart=always, RestartSec=5), the browser's
+    // request dies with the severed connection, and fetch() reports the only
+    // thing a browser can see at that point: "Failed to fetch". The real
+    // database error never reaches the screen, and the service crash-loops for
+    // as long as the schema is wrong.
+    //
+    // Catching it here does two separate jobs:
+    //   * the process can no longer be killed by a failed dropdown query, so the
+    //     genuine error gets returned and shown, and
+    //   * failing to read the Year / Service Level lists degrades to EMPTY
+    //     dropdowns rather than taking a perfectly good set of figures with it.
+    //     The page already falls back to the current year when the list is empty.
+    // -----------------------------------------------------------------------
+    const facetsPromise = cachedLong(facetsKey, () => Q.facets(company.sqlKey))
+      .catch((e) => {
+        console.warn('[analytics] facets failed — the dropdowns will be empty:', e?.message || e);
+        return { years: [], serviceLevels: [] };
+      });
 
     const startedAt = Date.now();
     const roll = await cached(yearKey, () => Q.yearRollup(f));
@@ -412,8 +456,40 @@ app.get('/analytics/overview', async (req, res) => {
   } catch (e) {
     const status = e.status || 500;
     if (status >= 500) console.error('[analytics] overview failed:', e?.message || e);
+    // If the extract has been changed UNDER a running service, the names were
+    // resolved before the change and every read now fails on a column or table
+    // that has moved. Throw the remembered answer away so the next request
+    // re-reads the real schema and picks the change up on its own — otherwise
+    // the dashboard stays broken until somebody notices and restarts it.
+    if (isSchemaDrift(e)) {
+      console.warn('[analytics] the extract looks like it has changed — re-reading the schema on the next request');
+      forgetSchema();
+    }
     res.status(status).json({ error: e.message || 'Analytics failed.' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// LAST LINE OF DEFENCE — a read-only service must never die of a failed read.
+//
+// The facets promise above was one specific way an unhandled rejection could
+// take this process down. These two handlers make sure there is no second way.
+// Without them, ANY promise that rejects with nobody awaiting it kills the
+// service, and every dashboard open at that moment gets "Failed to fetch" —
+// a message that says nothing about the cause and sends people to look at the
+// network when the problem is a column name.
+//
+// Deliberately LOG AND CARRY ON rather than exit. Nothing here writes to the
+// database, holds a transaction, or mutates shared state that could be left
+// half-finished, so there is no corrupted state to protect by dying. The
+// request that caused it has already had its own error handled and answered;
+// staying up means the next request gets a real answer instead of a dead socket.
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason) => {
+  console.error('[analytics] unhandled promise rejection (service kept running):', reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[analytics] uncaught exception (service kept running):', err?.stack || err?.message || err);
 });
 
 app.listen(PORT, () => {

@@ -1,8 +1,13 @@
 // ---------------------------------------------------------------------------
-// THE ONLY FILE THAT KNOWS THE DATABASE — now written against the REAL schema
-// of stream_data_extract_sgk, not guesses.
+// THE ONLY FILE THAT KNOWS THE DATABASE.
 //
-// What we learned from the extract:
+// It no longer knows it by ASSUMPTION. Every table and column name used below is
+// resolved against the live database first (see schema.js) and the SQL is built
+// from what is really there. That is the difference between "somebody renamed a
+// column and the whole dashboard went dark" and "somebody renamed a column and
+// nothing happened".
+//
+// What the extract holds:
 //   orders  one row per order.  Client = PartnerName.  Money = OrderCharges.
 //           Status is carried as FLAGS (OrderStatusCompleteFlag) rather than
 //           strings, which is better — no worrying about spelling or casing.
@@ -13,59 +18,50 @@
 //   drops   finer-grained than stops (splits collection from delivery). Not
 //           used here — stops is the right grain for "attempts".
 //
-// Every name below can still be overridden by an env var, but the defaults are
-// now the actual column names, so nothing needs setting for it to work.
+// Those are the names as at the last discovery run. They are the FIRST thing
+// looked for, not the only thing: if the extract has moved on, schema.js finds
+// where it moved to, and anything that is genuinely gone is left out of the SQL
+// so its tile shows a dash instead of taking the page down with it.
+//
+// Every name can still be pinned with an env var (SQL_ORDERS_CLIENT_COL and
+// friends) — that is checked before anything else.
 // ---------------------------------------------------------------------------
 import { query } from './db.js';
 import { avgSecondsExpr, sumSecondsExpr, columnTypes, configuredUnit } from './durations.js';
+import { resolveSchema, ident, CONFIGURED } from './schema.js';
 
-const env = (k, fallback) => (process.env[k] || fallback);
+/**
+ * The names this service EXPECTS, before the database is consulted.
+ *
+ * Kept as a named export because it is the readable statement of intent; the
+ * names actually used in a query come from `await resolveSchema()`.
+ */
+export const SCHEMA = CONFIGURED;
 
-function ident(name) {
-  const s = String(name || '').trim();
-  if (!/^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/.test(s)) {
-    throw new Error(`Refusing to use "${s}" as a SQL identifier — check your SCHEMA config.`);
-  }
-  return s.split('.').map((p) => `\`${p}\``).join('.');
-}
+/**
+ * A column, quoted — or the literal NULL when the database does not have it.
+ *
+ * This is the whole graceful-degradation mechanism, and it is deliberately
+ * boring: `SUM(NULL)` and `AVG(NULL)` are valid MySQL and both return NULL, so a
+ * missing measure arrives at the dashboard as "no figure" and every other column
+ * in the same SELECT is completely unaffected.
+ */
+const col = (name) => (name ? ident(name) : 'NULL');
 
-export const SCHEMA = {
-  orders:        env('SQL_ORDERS_TABLE', 'orders'),
-  o_client:      env('SQL_ORDERS_CLIENT_COL', 'PartnerName'),
-  o_id:          env('SQL_ORDERS_ID_COL', 'OrderID'),
-  o_value:       env('SQL_ORDERS_VALUE_COL', 'OrderCharges'),      // what the client is charged
-  o_weight:      env('SQL_ORDERS_WEIGHT_COL', 'OrderWeight'),
-  o_cube:        env('SQL_ORDERS_CUBE_COL', 'OrderCube'),
-  o_items:       env('SQL_ORDERS_ITEMS_COL', 'OrderItemsCount'),
-  o_service:     env('SQL_ORDERS_SERVICE_COL', 'ServiceLevelName'),
-  o_completeFlag: env('SQL_ORDERS_COMPLETE_FLAG', 'OrderStatusCompleteFlag'),
-  o_date:        env('SQL_ORDERS_DATE_COL', 'OrderDate'),
-  o_statusName:  env('SQL_ORDERS_STATUS_COL', 'OrderStatusName'),
-  // The three durations the WMS has already worked out for us.
-  //
-  // NOT IN DAYS — that was an unchecked assumption written when this schema was
-  // first read, and it is what put "384,329.26 days" on a client's dashboard.
-  // The unit is worked out at runtime in durations.js from the column's real
-  // type; see the long note at the top of that file.
-  o_confToBook:  env('SQL_ORDERS_CONF_TO_BOOK', 'OrderTimeConfToBook'),
-  o_bookToDone:  env('SQL_ORDERS_BOOK_TO_DONE', 'OrderTimeBookToCompleted'),
-  o_confToDone:  env('SQL_ORDERS_CONF_TO_DONE', 'OrderTimeConfToCompleted'),
-  o_bookReqFlag: env('SQL_ORDERS_BOOK_REQ_FLAG', 'OrderBookingReqFlag'),
-  o_bookConfFlag: env('SQL_ORDERS_BOOK_CONF_FLAG', 'OrderBookingConfFlag'),
+/**
+ * The same, for a column on an aliased table.
+ *
+ * It has to be its own helper rather than `a.` + col(): a missing column has to
+ * collapse to the bare literal `NULL`, and `a.NULL` is not valid SQL — it would
+ * turn a missing flag into a syntax error and take the whole read down, which is
+ * the exact failure this file exists to stop.
+ */
+const aliasCol = (alias, name) => (name ? `${alias}.${ident(name)}` : 'NULL');
 
-  attempts:      env('SQL_ATTEMPTS_TABLE', 'stops'),
-  a_client:      env('SQL_ATTEMPTS_CLIENT_COL', 'PartnerName'),
-  a_order:       env('SQL_ATTEMPTS_ORDER_COL', 'OrderID'),
-  a_date:        env('SQL_ATTEMPTS_DATE_COL', 'RunDate'),
-  a_okFlag:      env('SQL_ATTEMPTS_OK_FLAG', 'StopStatusCompleteFlag'),
-  a_failFlag:    env('SQL_ATTEMPTS_FAIL_FLAG', 'StopStatusFailedFlag'),
-  a_onTimeFlag:  env('SQL_ATTEMPTS_ONTIME_FLAG', 'StopTimeOnTimeFlag'),
-  a_lateFlag:    env('SQL_ATTEMPTS_LATE_FLAG', 'StopTimeLateFlag'),
-  a_earlyFlag:   env('SQL_ATTEMPTS_EARLY_FLAG', 'StopTimeEarlyFlag'),
-  a_outstandFlag: env('SQL_ATTEMPTS_OUTSTANDING_FLAG', 'StopStatusOutstandingFlag'),
-};
+/** Is this column really there? Used where NULL is not a valid substitute. */
+const has = (name) => Boolean(name);
 
-const oDate = (alias = '') => `${alias ? alias + '.' : ''}${ident(SCHEMA.o_date)}`;
+const oDate = (S, alias = '') => `${alias ? alias + '.' : ''}${ident(S.o_date)}`;
 
 // ---------------------------------------------------------------------------
 // FILTERS — the client key is never optional and a caller cannot drop it.
@@ -85,11 +81,14 @@ function clientKeys(f) {
 const EXCLUDED = String(process.env.SQL_ORDERS_EXCLUDE_STATUSES ?? 'Cancelled')
   .split(',').map((x) => x.trim()).filter(Boolean);
 
-function excludeClause(alias, params) {
-  if (!EXCLUDED.length) return '';
+function excludeClause(S, alias, params) {
+  // No status column in the extract any more means nothing to exclude ON. Left
+  // out rather than faked: including cancelled orders is a visible, explainable
+  // difference, and it is reported by /health as an unavailable column.
+  if (!EXCLUDED.length || !has(S.o_statusName)) return '';
   const p = alias ? `${alias}.` : '';
   EXCLUDED.forEach((v, i) => { params[`ex${i}`] = v; });
-  return ` AND ${p}${ident(SCHEMA.o_statusName)} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')})`;
+  return ` AND ${p}${ident(S.o_statusName)} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,62 +138,80 @@ function pushDateConds(conds, params, d, f) {
   if (f.to)   { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
 }
 
-function orderFilter(f, alias = '') {
+function orderFilter(S, f, alias = '') {
   const p = alias ? `${alias}.` : '';
-  const d = oDate(alias);
+  const d = oDate(S, alias);
   const ck = clientKeys(f);
-  const conds = [`${p}${ident(SCHEMA.o_client)} IN (${ck.placeholders})`];
+  const conds = [`${p}${ident(S.o_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
 
   pushDateConds(conds, params, d, f);
-  if (f.service) { conds.push(`${p}${ident(SCHEMA.o_service)} = :service`); params.service = String(f.service); }
+  // A service filter with no service column would silently match nothing. The
+  // dropdown is fed from the same column, so it is empty in that case and this
+  // never fires — but if one is passed by hand it is ignored rather than
+  // quietly emptying the dashboard.
+  if (f.service && has(S.o_service)) { conds.push(`${p}${ident(S.o_service)} = :service`); params.service = String(f.service); }
 
-  return { where: `WHERE ${conds.join(' AND ')}${excludeClause(alias, params)}`, params, date: d };
+  return { where: `WHERE ${conds.join(' AND ')}${excludeClause(S, alias, params)}`, params, date: d };
 }
 
 // stops carry their own PartnerName and ServiceLevelName, so no join is needed.
-function attemptFilter(f) {
-  const d = `a.${ident(SCHEMA.a_date)}`;
+function attemptFilter(S, f) {
+  const d = `a.${ident(S.a_date)}`;
   const ck = clientKeys(f);
-  const conds = [`a.${ident(SCHEMA.a_client)} IN (${ck.placeholders})`];
+  const conds = [`a.${ident(S.a_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
 
   pushDateConds(conds, params, d, f);
-  if (f.service) { conds.push(`a.\`ServiceLevelName\` = :service`); params.service = String(f.service); }
+  if (f.service && has(S.a_service)) { conds.push(`a.${ident(S.a_service)} = :service`); params.service = String(f.service); }
 
   return { where: `WHERE ${conds.join(' AND ')}`, params, date: d };
 }
+
+/**
+ * The three duration columns' real types — asked for only for the ones that
+ * exist, so a renamed column cannot make this fail.
+ */
+async function durationTypes(S) {
+  const cols = [S.o_confToBook, S.o_bookToDone, S.o_confToDone].filter(Boolean);
+  return cols.length ? columnTypes(S.orders, cols) : {};
+}
+
+/** AVG of a duration column in seconds, or NULL when the column is not there. */
+const durAvg = (types, name) => (name ? avgSecondsExpr(types[name], ident(name)) : 'NULL');
+/** SUM of a duration column in seconds, or NULL when the column is not there. */
+const durSum = (types, name) => (name ? sumSecondsExpr(types[name], ident(name)) : 'NULL');
 
 // ---------------------------------------------------------------------------
 // THE READS
 // ---------------------------------------------------------------------------
 
 export async function orderTotals(f) {
-  const { where, params } = orderFilter(f);
+  const S = await resolveSchema();
+  const { where, params } = orderFilter(S, f);
   // The three duration columns come back as SECONDS whatever they are stored as.
-  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
-  const dur = (col) => avgSecondsExpr(t[col], ident(col));
+  const t = await durationTypes(S);
 
   const rows = await query(`
     SELECT
-      SUM(${ident(SCHEMA.o_value)})             AS totalSales,
-      COUNT(DISTINCT ${ident(SCHEMA.o_id)})     AS totalOrders,
-      SUM(COALESCE(${ident(SCHEMA.o_completeFlag)}, 0)) AS completedOrders,
-      AVG(${ident(SCHEMA.o_weight)})            AS avgWeightKg,
-      AVG(${ident(SCHEMA.o_cube)})              AS avgCubeM3,
-      AVG(${ident(SCHEMA.o_items)})             AS avgItemsPerOrder,
-      ${dur(SCHEMA.o_confToBook)}               AS avgReceivedToProposedSec,
-      ${dur(SCHEMA.o_bookToDone)}               AS avgReceivedToDeliveredSec,
-      ${dur(SCHEMA.o_confToDone)}               AS avgConfToCompletedSec,
+      SUM(${col(S.o_value)})               AS totalSales,
+      COUNT(DISTINCT ${ident(S.o_id)})     AS totalOrders,
+      SUM(COALESCE(${col(S.o_completeFlag)}, 0)) AS completedOrders,
+      AVG(${col(S.o_weight)})              AS avgWeightKg,
+      AVG(${col(S.o_cube)})                AS avgCubeM3,
+      AVG(${col(S.o_items)})               AS avgItemsPerOrder,
+      ${durAvg(t, S.o_confToBook)}         AS avgReceivedToProposedSec,
+      ${durAvg(t, S.o_bookToDone)}         AS avgReceivedToDeliveredSec,
+      ${durAvg(t, S.o_confToDone)}         AS avgConfToCompletedSec,
       -- the RAW averages, untouched, so the diagnostic can show what the column
       -- actually holds rather than what we decided it holds
-      AVG(${ident(SCHEMA.o_confToBook)})        AS rawConfToBook,
-      AVG(${ident(SCHEMA.o_bookToDone)})        AS rawBookToDone,
-      AVG(${ident(SCHEMA.o_confToDone)})        AS rawConfToDone,
+      AVG(${col(S.o_confToBook)})          AS rawConfToBook,
+      AVG(${col(S.o_bookToDone)})          AS rawBookToDone,
+      AVG(${col(S.o_confToDone)})          AS rawConfToDone,
       -- proposals the customer accepted first time round
-      SUM(COALESCE(${ident(SCHEMA.o_bookReqFlag)}, 0))  AS bookingsRequested,
-      SUM(COALESCE(${ident(SCHEMA.o_bookConfFlag)}, 0)) AS bookingsConfirmed
-    FROM ${ident(SCHEMA.orders)}
+      SUM(COALESCE(${col(S.o_bookReqFlag)}, 0))  AS bookingsRequested,
+      SUM(COALESCE(${col(S.o_bookConfFlag)}, 0)) AS bookingsConfirmed
+    FROM ${ident(S.orders)}
     ${where}
   `, params);
   return { ...(rows[0] || {}), _durationUnit: configuredUnit(), _columnTypes: t };
@@ -206,16 +223,16 @@ export async function orderTotals(f) {
  * anyone guessing again.
  */
 export async function durationDiagnostics(f) {
-  const { where, params } = orderFilter(f);
-  const cols = [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone];
-  const t = await columnTypes(SCHEMA.orders, cols);
+  const S = await resolveSchema();
+  const { where, params } = orderFilter(S, f);
+  const t = await durationTypes(S);
   const rows = await query(`
     SELECT
       COUNT(*) AS rows_considered,
-      MIN(${ident(SCHEMA.o_confToBook)}) AS minConfToBook, AVG(${ident(SCHEMA.o_confToBook)}) AS avgConfToBook, MAX(${ident(SCHEMA.o_confToBook)}) AS maxConfToBook,
-      MIN(${ident(SCHEMA.o_bookToDone)}) AS minBookToDone, AVG(${ident(SCHEMA.o_bookToDone)}) AS avgBookToDone, MAX(${ident(SCHEMA.o_bookToDone)}) AS maxBookToDone,
-      MIN(${ident(SCHEMA.o_confToDone)}) AS minConfToDone, AVG(${ident(SCHEMA.o_confToDone)}) AS avgConfToDone, MAX(${ident(SCHEMA.o_confToDone)}) AS maxConfToDone
-    FROM ${ident(SCHEMA.orders)}
+      MIN(${col(S.o_confToBook)}) AS minConfToBook, AVG(${col(S.o_confToBook)}) AS avgConfToBook, MAX(${col(S.o_confToBook)}) AS maxConfToBook,
+      MIN(${col(S.o_bookToDone)}) AS minBookToDone, AVG(${col(S.o_bookToDone)}) AS avgBookToDone, MAX(${col(S.o_bookToDone)}) AS maxBookToDone,
+      MIN(${col(S.o_confToDone)}) AS minConfToDone, AVG(${col(S.o_confToDone)}) AS avgConfToDone, MAX(${col(S.o_confToDone)}) AS maxConfToDone
+    FROM ${ident(S.orders)}
     ${where}
   `, params);
   return { columnTypes: t, unitInUse: configuredUnit(), raw: rows[0] || {} };
@@ -224,12 +241,13 @@ export async function durationDiagnostics(f) {
 // Split of orders across the PartnerName values this company owns — the pie on
 // the first page of the report.
 export async function byPartner(f) {
-  const { where, params } = orderFilter(f);
+  const S = await resolveSchema();
+  const { where, params } = orderFilter(S, f);
   return query(`
-    SELECT ${ident(SCHEMA.o_client)} AS name, COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders
-    FROM ${ident(SCHEMA.orders)}
+    SELECT ${ident(S.o_client)} AS name, COUNT(DISTINCT ${ident(S.o_id)}) AS orders
+    FROM ${ident(S.orders)}
     ${where}
-    GROUP BY ${ident(SCHEMA.o_client)}
+    GROUP BY ${ident(S.o_client)}
     ORDER BY orders DESC
   `, params);
 }
@@ -241,35 +259,39 @@ export async function byPartner(f) {
 // caller was holding anyway. OrderID is the primary key, so COUNT(*) and
 // COUNT(DISTINCT OrderID) are the same figure; the server now uses totalOrders.
 export async function firstTimeSuccess(f) {
-  const { where, params } = orderFilter(f, 'o');
+  const S = await resolveSchema();
+  if (!S.attempts) return {};
+  const { where, params } = orderFilter(S, f, 'o');
   const rows = await query(`
     SELECT
       SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END) AS firstTimeSuccessOrders
     FROM (
-      SELECT a.${ident(SCHEMA.a_order)} AS OrderID,
+      SELECT a.${ident(S.a_order)} AS OrderID,
              COUNT(*) AS attempts,
-             SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0)) AS good
-      FROM ${ident(SCHEMA.attempts)} a
-      JOIN ${ident(SCHEMA.orders)} o ON o.${ident(SCHEMA.o_id)} = a.${ident(SCHEMA.a_order)}
+             SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0)) AS good
+      FROM ${ident(S.attempts)} a
+      JOIN ${ident(S.orders)} o ON o.${ident(S.o_id)} = a.${ident(S.a_order)}
       ${where}
-      GROUP BY a.${ident(SCHEMA.a_order)}
+      GROUP BY a.${ident(S.a_order)}
     ) t
   `, params);
   return rows[0] || {};
 }
 
 export async function attemptTotals(f) {
-  const { where, params } = attemptFilter(f);
+  const S = await resolveSchema();
+  if (!S.attempts) return {};
+  const { where, params } = attemptFilter(S, f);
   const rows = await query(`
     SELECT
-      COUNT(*)                                            AS total,
-      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))       AS successful,
-      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0))     AS failed,
-      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))    AS onTime,
-      SUM(COALESCE(a.${ident(SCHEMA.a_lateFlag)}, 0))      AS late,
-      SUM(COALESCE(a.${ident(SCHEMA.a_earlyFlag)}, 0))     AS early,
-      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0))  AS outstanding
-    FROM ${ident(SCHEMA.attempts)} a
+      COUNT(*)                                       AS total,
+      SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0))        AS successful,
+      SUM(COALESCE(${aliasCol('a', S.a_failFlag)}, 0))      AS failed,
+      SUM(COALESCE(${aliasCol('a', S.a_onTimeFlag)}, 0))    AS onTime,
+      SUM(COALESCE(${aliasCol('a', S.a_lateFlag)}, 0))      AS late,
+      SUM(COALESCE(${aliasCol('a', S.a_earlyFlag)}, 0))     AS early,
+      SUM(COALESCE(${aliasCol('a', S.a_outstandFlag)}, 0))  AS outstanding
+    FROM ${ident(S.attempts)} a
     ${where}
   `, params);
   return rows[0] || {};
@@ -277,35 +299,37 @@ export async function attemptTotals(f) {
 
 // Orders nobody has been out to yet.
 export async function noAttemptCount(f) {
-  const { where, params } = orderFilter(f, 'o');
+  const S = await resolveSchema();
+  if (!S.attempts) return 0;
+  const { where, params } = orderFilter(S, f, 'o');
   const rows = await query(`
     SELECT COUNT(*) AS noAttempt
-    FROM ${ident(SCHEMA.orders)} o
+    FROM ${ident(S.orders)} o
     ${where}
       AND NOT EXISTS (
-        SELECT 1 FROM ${ident(SCHEMA.attempts)} a
-        WHERE a.${ident(SCHEMA.a_order)} = o.${ident(SCHEMA.o_id)}
+        SELECT 1 FROM ${ident(S.attempts)} a
+        WHERE a.${ident(S.a_order)} = o.${ident(S.o_id)}
       )
   `, params);
   return Number(rows[0]?.noAttempt || 0);
 }
 
 export async function byMonth(f) {
-  const { where, params, date } = orderFilter(f);
-  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
-  const dur = (col) => avgSecondsExpr(t[col], ident(col));
+  const S = await resolveSchema();
+  const { where, params, date } = orderFilter(S, f);
+  const t = await durationTypes(S);
   return query(`
     SELECT
       YEAR(${date}) AS y, MONTH(${date}) AS m,
-      SUM(${ident(SCHEMA.o_value)})         AS sales,
-      COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders,
-      AVG(${ident(SCHEMA.o_weight)})        AS avgWeightKg,
-      AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3,
-      AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder,
-      ${dur(SCHEMA.o_confToDone)}           AS avgConfToCompletedSec,
-      ${dur(SCHEMA.o_bookToDone)}           AS avgReceivedToDeliveredSec,
-      ${dur(SCHEMA.o_confToBook)}           AS avgReceivedToProposedSec
-    FROM ${ident(SCHEMA.orders)}
+      SUM(${col(S.o_value)})           AS sales,
+      COUNT(DISTINCT ${ident(S.o_id)}) AS orders,
+      AVG(${col(S.o_weight)})          AS avgWeightKg,
+      AVG(${col(S.o_cube)})            AS avgCubeM3,
+      AVG(${col(S.o_items)})           AS avgItemsPerOrder,
+      ${durAvg(t, S.o_confToDone)}     AS avgConfToCompletedSec,
+      ${durAvg(t, S.o_bookToDone)}     AS avgReceivedToDeliveredSec,
+      ${durAvg(t, S.o_confToBook)}     AS avgReceivedToProposedSec
+    FROM ${ident(S.orders)}
     ${where}
     GROUP BY YEAR(${date}), MONTH(${date})
     ORDER BY y, m
@@ -313,15 +337,17 @@ export async function byMonth(f) {
 }
 
 export async function attemptsByMonth(f) {
-  const { where, params, date } = attemptFilter(f);
+  const S = await resolveSchema();
+  if (!S.attempts) return [];
+  const { where, params, date } = attemptFilter(S, f);
   return query(`
     SELECT
       YEAR(${date}) AS y, MONTH(${date}) AS m,
-      COUNT(*)                                        AS total,
-      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))   AS successful,
-      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0)) AS failed,
-      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0)) AS unknown
-    FROM ${ident(SCHEMA.attempts)} a
+      COUNT(*)                                          AS total,
+      SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0))           AS successful,
+      SUM(COALESCE(${aliasCol('a', S.a_failFlag)}, 0))         AS failed,
+      SUM(COALESCE(${aliasCol('a', S.a_outstandFlag)}, 0))     AS unknown
+    FROM ${ident(S.attempts)} a
     ${where}
     GROUP BY YEAR(${date}), MONTH(${date})
     ORDER BY y, m
@@ -330,17 +356,18 @@ export async function attemptsByMonth(f) {
 
 // Weeks run Monday to Sunday. WEEKDAY() is 0 on a Monday whatever the locale.
 export async function byWeek(f) {
-  const { where, params, date } = orderFilter(f);
+  const S = await resolveSchema();
+  const { where, params, date } = orderFilter(S, f);
   const monday = `DATE_SUB(DATE(${date}), INTERVAL WEEKDAY(${date}) DAY)`;
   return query(`
     SELECT
       ${monday} AS weekStart,
-      SUM(${ident(SCHEMA.o_value)})         AS sales,
-      COUNT(DISTINCT ${ident(SCHEMA.o_id)}) AS orders,
-      AVG(${ident(SCHEMA.o_weight)})        AS avgWeightKg,
-      AVG(${ident(SCHEMA.o_cube)})          AS avgCubeM3,
-      AVG(${ident(SCHEMA.o_items)})         AS avgItemsPerOrder
-    FROM ${ident(SCHEMA.orders)}
+      SUM(${col(S.o_value)})           AS sales,
+      COUNT(DISTINCT ${ident(S.o_id)}) AS orders,
+      AVG(${col(S.o_weight)})          AS avgWeightKg,
+      AVG(${col(S.o_cube)})            AS avgCubeM3,
+      AVG(${col(S.o_items)})           AS avgItemsPerOrder
+    FROM ${ident(S.orders)}
     ${where}
     GROUP BY ${monday}
     ORDER BY weekStart
@@ -360,83 +387,89 @@ export async function byWeek(f) {
 // the year once and slice it afterwards.
 // ---------------------------------------------------------------------------
 export async function yearRollup(f) {
+  const S = await resolveSchema();
   const yearOnly = { ...f, month: null };
-  const { where, params, date } = orderFilter(yearOnly);
-  const aFilter = attemptFilter(yearOnly);
+  const { where, params, date } = orderFilter(S, yearOnly);
+  const aFilter = S.attempts ? attemptFilter(S, yearOnly) : null;
+  const oScoped = orderFilter(S, yearOnly, 'o');
   const monday = `DATE_SUB(DATE(${date}), INTERVAL WEEKDAY(${date}) DAY)`;
 
-  const t = await columnTypes(SCHEMA.orders, [SCHEMA.o_confToBook, SCHEMA.o_bookToDone, SCHEMA.o_confToDone]);
-  const durSum = (col) => sumSecondsExpr(t[col], ident(col));
+  const t = await durationTypes(S);
 
   // 1. ORDERS, at (month, week, partner) grain — about 120 rows for a year.
   const ordersP = query(`
     SELECT
       YEAR(${date}) AS y, MONTH(${date}) AS m,
       ${monday} AS weekStart,
-      ${ident(SCHEMA.o_client)} AS partner,
-      SUM(${ident(SCHEMA.o_value)})                     AS sales,
-      COUNT(DISTINCT ${ident(SCHEMA.o_id)})             AS orders,
-      SUM(COALESCE(${ident(SCHEMA.o_completeFlag)}, 0)) AS completed,
-      SUM(COALESCE(${ident(SCHEMA.o_bookReqFlag)}, 0))  AS bookReq,
-      SUM(COALESCE(${ident(SCHEMA.o_bookConfFlag)}, 0)) AS bookConf,
-      SUM(${ident(SCHEMA.o_weight)}) AS weightSum, COUNT(${ident(SCHEMA.o_weight)}) AS weightCnt,
-      SUM(${ident(SCHEMA.o_cube)})   AS cubeSum,   COUNT(${ident(SCHEMA.o_cube)})   AS cubeCnt,
-      SUM(${ident(SCHEMA.o_items)})  AS itemsSum,  COUNT(${ident(SCHEMA.o_items)})  AS itemsCnt,
-      ${durSum(SCHEMA.o_confToBook)} AS confToBookSum, COUNT(${ident(SCHEMA.o_confToBook)}) AS confToBookCnt,
-      ${durSum(SCHEMA.o_bookToDone)} AS bookToDoneSum, COUNT(${ident(SCHEMA.o_bookToDone)}) AS bookToDoneCnt,
-      ${durSum(SCHEMA.o_confToDone)} AS confToDoneSum, COUNT(${ident(SCHEMA.o_confToDone)}) AS confToDoneCnt
-    FROM ${ident(SCHEMA.orders)}
+      ${ident(S.o_client)} AS partner,
+      SUM(${col(S.o_value)})                       AS sales,
+      COUNT(DISTINCT ${ident(S.o_id)})             AS orders,
+      SUM(COALESCE(${col(S.o_completeFlag)}, 0))   AS completed,
+      SUM(COALESCE(${col(S.o_bookReqFlag)}, 0))    AS bookReq,
+      SUM(COALESCE(${col(S.o_bookConfFlag)}, 0))   AS bookConf,
+      SUM(${col(S.o_weight)}) AS weightSum, COUNT(${col(S.o_weight)}) AS weightCnt,
+      SUM(${col(S.o_cube)})   AS cubeSum,   COUNT(${col(S.o_cube)})   AS cubeCnt,
+      SUM(${col(S.o_items)})  AS itemsSum,  COUNT(${col(S.o_items)})  AS itemsCnt,
+      ${durSum(t, S.o_confToBook)} AS confToBookSum, COUNT(${col(S.o_confToBook)}) AS confToBookCnt,
+      ${durSum(t, S.o_bookToDone)} AS bookToDoneSum, COUNT(${col(S.o_bookToDone)}) AS bookToDoneCnt,
+      ${durSum(t, S.o_confToDone)} AS confToDoneSum, COUNT(${col(S.o_confToDone)}) AS confToDoneCnt
+    FROM ${ident(S.orders)}
     ${where}
     GROUP BY y, m, weekStart, partner
   `, params);
 
-  // 2. ATTEMPTS, by month.
-  const attemptsP = query(`
+  // 2. ATTEMPTS, by month. Skipped entirely when the extract has no attempts
+  //    table — the orders half of the dashboard still loads.
+  const attemptsP = aFilter ? query(`
     SELECT
       YEAR(${aFilter.date}) AS y, MONTH(${aFilter.date}) AS m,
-      COUNT(*)                                            AS total,
-      SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0))       AS successful,
-      SUM(COALESCE(a.${ident(SCHEMA.a_failFlag)}, 0))     AS failed,
-      SUM(COALESCE(a.${ident(SCHEMA.a_onTimeFlag)}, 0))   AS onTime,
-      SUM(COALESCE(a.${ident(SCHEMA.a_lateFlag)}, 0))     AS late,
-      SUM(COALESCE(a.${ident(SCHEMA.a_earlyFlag)}, 0))    AS early,
-      SUM(COALESCE(a.${ident(SCHEMA.a_outstandFlag)}, 0)) AS outstanding
-    FROM ${ident(SCHEMA.attempts)} a
+      COUNT(*)                                       AS total,
+      SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0))        AS successful,
+      SUM(COALESCE(${aliasCol('a', S.a_failFlag)}, 0))      AS failed,
+      SUM(COALESCE(${aliasCol('a', S.a_onTimeFlag)}, 0))    AS onTime,
+      SUM(COALESCE(${aliasCol('a', S.a_lateFlag)}, 0))      AS late,
+      SUM(COALESCE(${aliasCol('a', S.a_earlyFlag)}, 0))     AS early,
+      SUM(COALESCE(${aliasCol('a', S.a_outstandFlag)}, 0))  AS outstanding
+    FROM ${ident(S.attempts)} a
     ${aFilter.where}
     GROUP BY y, m
-  `, aFilter.params);
+  `, aFilter.params) : Promise.resolve([]);
 
   // 3. PER-ORDER attempt counts, by month — first-time success and the orders
   //    nobody has been out to. A LEFT JOIN gets both from ONE pass; they used to
   //    be two separate queries over the same two tables.
-  const perOrderP = query(`
+  const perOrderP = S.attempts ? query(`
     SELECT t.y, t.m,
       SUM(CASE WHEN t.attempts = 0 THEN 1 ELSE 0 END)                    AS noAttempt,
       SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END)     AS firstTime,
       COUNT(*)                                                           AS scopedOrders
     FROM (
-      SELECT YEAR(${oDate('o')}) AS y, MONTH(${oDate('o')}) AS m,
-             o.${ident(SCHEMA.o_id)} AS oid,
-             COUNT(a.${ident(SCHEMA.a_order)}) AS attempts,
-             SUM(COALESCE(a.${ident(SCHEMA.a_okFlag)}, 0)) AS good
-      FROM ${ident(SCHEMA.orders)} o
-      LEFT JOIN ${ident(SCHEMA.attempts)} a ON a.${ident(SCHEMA.a_order)} = o.${ident(SCHEMA.o_id)}
-      ${orderFilter(yearOnly, 'o').where}
+      SELECT YEAR(${oDate(S, 'o')}) AS y, MONTH(${oDate(S, 'o')}) AS m,
+             o.${ident(S.o_id)} AS oid,
+             COUNT(a.${ident(S.a_order)}) AS attempts,
+             SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0)) AS good
+      FROM ${ident(S.orders)} o
+      LEFT JOIN ${ident(S.attempts)} a ON a.${ident(S.a_order)} = o.${ident(S.o_id)}
+      ${oScoped.where}
       GROUP BY y, m, oid
     ) t
     GROUP BY t.y, t.m
-  `, orderFilter(yearOnly, 'o').params);
+  `, oScoped.params) : Promise.resolve([]);
 
   const [orderRows, attemptRows, perOrderRows] = await Promise.all([ordersP, attemptsP, perOrderP]);
   return { orderRows, attemptRows, perOrderRows, durationUnit: configuredUnit() };
 }
 
 export async function facets(clientKey) {
-  const d = oDate();
+  const S = await resolveSchema();
+  const d = oDate(S);
   const ck = clientKeys({ clientKey });
   const [years, services] = await Promise.all([
-    query(`SELECT DISTINCT YEAR(${d}) AS y FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} IN (${ck.placeholders}) AND ${d} IS NOT NULL ORDER BY y DESC`, ck.params),
-    query(`SELECT DISTINCT ${ident(SCHEMA.o_service)} AS s FROM ${ident(SCHEMA.orders)} WHERE ${ident(SCHEMA.o_client)} IN (${ck.placeholders}) AND ${ident(SCHEMA.o_service)} IS NOT NULL ORDER BY s`, ck.params),
+    query(`SELECT DISTINCT YEAR(${d}) AS y FROM ${ident(S.orders)} WHERE ${ident(S.o_client)} IN (${ck.placeholders}) AND ${d} IS NOT NULL ORDER BY y DESC`, ck.params),
+    // No service column means no Service Level dropdown, rather than no dashboard.
+    has(S.o_service)
+      ? query(`SELECT DISTINCT ${ident(S.o_service)} AS s FROM ${ident(S.orders)} WHERE ${ident(S.o_client)} IN (${ck.placeholders}) AND ${ident(S.o_service)} IS NOT NULL ORDER BY s`, ck.params)
+      : Promise.resolve([]),
   ]);
   return {
     years: years.map((r) => Number(r.y)).filter(Boolean),
@@ -448,11 +481,12 @@ export async function facets(clientKey) {
 // goes in CLIENT_MAP as sqlKey — SGK staff can read it straight off the service
 // instead of anyone having to run a query by hand.
 export async function partnerNames() {
+  const S = await resolveSchema();
   return query(`
-    SELECT ${ident(SCHEMA.o_client)} AS partnerName, COUNT(*) AS orders
-    FROM ${ident(SCHEMA.orders)}
-    WHERE ${ident(SCHEMA.o_client)} IS NOT NULL AND ${ident(SCHEMA.o_client)} <> ''
-    GROUP BY ${ident(SCHEMA.o_client)}
+    SELECT ${ident(S.o_client)} AS partnerName, COUNT(*) AS orders
+    FROM ${ident(S.orders)}
+    WHERE ${ident(S.o_client)} IS NOT NULL AND ${ident(S.o_client)} <> ''
+    GROUP BY ${ident(S.o_client)}
     ORDER BY orders DESC
   `);
 }
