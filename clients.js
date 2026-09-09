@@ -187,24 +187,13 @@ export function resolveCompany(identity, requested = {}) {
       || (companyName ? map.find((c) => norm(c.name) === norm(companyName)) : null)
       || (companyName ? map.find((c) => norm(c.companyId) === norm(companyName)) : null);
     if (!hit) {
-      // NEVER NAME THE OTHER COMPANIES HERE.
+      // The message says which company has no key, and nothing else.
       //
-      // This message is rendered in the analytics panel, under a heading that
-      // carries the company that WAS asked for. Listing every other configured
-      // client there puts one client's name on another client's screen. Only
-      // SGK staff can reach this branch today — but a message is one changed
-      // condition away from the client path, and the names buy nothing that a
-      // count does not.
-      //
-      // So: say which company is missing, say how many are configured (enough
-      // to tell "not set up yet" from "map failed to load"), and stop there.
-      // /analytics/whoami still gives staff the full list on request.
+      // It renders in the analytics panel under that company's own heading, so
+      // anything beyond the name is somebody else's business on their screen —
+      // other clients' names, or how many are configured. Neither belongs here.
       throw Object.assign(
-        new Error(
-          `No analytics key configured for "${companyName || companyId}". `
-          + `${map.length} ${map.length === 1 ? 'company is' : 'companies are'} configured. `
-          + `Add this one to CLIENT_MAP with its PartnerName from the WMS.`,
-        ),
+        new Error(`No analytics key configured for "${companyName || companyId}".`),
         { status: 404 },
       );
     }
