@@ -79,6 +79,9 @@ export const CONFIGURED = {
   o_items:        env('SQL_ORDERS_ITEMS_COL', 'OrderItemsCount'),
   o_service:      env('SQL_ORDERS_SERVICE_COL', 'ServiceLevelName'),
   o_completeFlag: env('SQL_ORDERS_COMPLETE_FLAG', 'OrderStatusCompleteFlag'),
+  // Order-level "delivered on time". This is what Power BI's "First Time
+  // Successful Orders" is actually built on — NOT anything about attempts.
+  o_delOnTimeFlag: env('SQL_ORDERS_DEL_ONTIME_FLAG', 'DelOnTimeFlag'),
   o_date:         env('SQL_ORDERS_DATE_COL', 'OrderDate'),
   o_statusName:   env('SQL_ORDERS_STATUS_COL', 'OrderStatusName'),
   o_confToBook:   env('SQL_ORDERS_CONF_TO_BOOK', 'OrderTimeConfToBook'),
@@ -124,6 +127,7 @@ const ALIASES = {
   o_items:        ['OrderItemsCount', 'ItemCount', 'ItemsCount', 'OrderItems', 'Items', 'TotalItems', 'LineCount'],
   o_service:      ['ServiceLevelName', 'ServiceLevel', 'ServiceName', 'Service'],
   o_completeFlag: ['OrderStatusCompleteFlag', 'OrderCompleteFlag', 'OrderStatusComplete', 'CompleteFlag'],
+  o_delOnTimeFlag: ['DelOnTimeFlag', 'DeliveredOnTimeFlag', 'OnTimeFlag', 'DelOnTime'],
   o_date:         ['OrderDate', 'CreatedDate', 'OrderCreatedDate', 'OrderReceivedDate', 'ReceivedDate', 'OrderDateTime'],
   o_statusName:   ['OrderStatusName', 'OrderStatus', 'StatusName', 'Status'],
   o_confToBook:   ['OrderTimeConfToBook', 'OrderTimeConfirmedToBooked', 'TimeConfToBook'],

@@ -206,17 +206,39 @@ function orderFilter(S, f, alias = '') {
   };
 }
 
-// stops carry their own PartnerName and ServiceLevelName, so no join is needed.
+// ---------------------------------------------------------------------------
+// WHICH MONTH AN ATTEMPT BELONGS TO — the parent ORDER's date, not the stop's.
+//
+// This used to filter on the stop's own RunDate, which reads naturally: an
+// attempt made in August is an August attempt. It is also a different question
+// from the one the rest of the dashboard answers. An order placed on 30 July and
+// attempted on 3 August had its attempt counted in August while the order itself
+// sat in July, so the attempt figures were measured against a set of orders that
+// did not contain them. August alone drifted by 222 attempts.
+//
+// Scoping attempts to the order they belong to makes every figure on the page
+// describe the same orders. It also happens to reconcile exactly with the
+// client's Power BI report — 7,969 attempts, 7,470 successful, 2,595 → 271
+// failed, all three at once, which is not a coincidence three times over.
+//
+// The join is the cost. stops carries its own PartnerName so this used to need
+// no join at all; it does now, and OrderID is indexed on both sides.
+// ---------------------------------------------------------------------------
 function attemptFilter(S, f) {
-  const d = `a.${ident(S.a_date)}`;
+  const d = `o.${ident(S.o_date)}`;
   const ck = clientKeys(f);
-  const conds = [`a.${ident(S.a_client)} IN (${ck.placeholders})`];
+  const conds = [`o.${ident(S.o_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
 
   pushDateConds(conds, params, d, f);
-  if (f.service && has(S.a_service)) { conds.push(`a.${ident(S.a_service)} = :service`); params.service = String(f.service); }
+  if (f.service && has(S.o_service)) { conds.push(`o.${ident(S.o_service)} = :service`); params.service = String(f.service); }
 
-  return { where: `WHERE ${conds.join(' AND ')}`, params, date: d };
+  return {
+    where: `WHERE ${conds.join(' AND ')}`,
+    join: `JOIN ${ident(S.orders)} o ON o.${ident(S.o_id)} = a.${ident(S.a_order)}`,
+    params,
+    date: d,
+  };
 }
 
 /**
@@ -482,6 +504,7 @@ export async function yearRollup(f) {
       SUM(COALESCE(${aliasCol('a', S.a_earlyFlag)}, 0))     AS early,
       SUM(COALESCE(${aliasCol('a', S.a_outstandFlag)}, 0))  AS outstanding
     FROM ${ident(S.attempts)} a
+    ${aFilter.join}
     ${aFilter.where}
     GROUP BY y, m
   `, aFilter.params) : Promise.resolve([]);
@@ -491,14 +514,26 @@ export async function yearRollup(f) {
   //    be two separate queries over the same two tables.
   const perOrderP = S.attempts ? query(`
     SELECT t.y, t.m,
-      SUM(CASE WHEN t.attempts = 0 THEN 1 ELSE 0 END)                    AS noAttempt,
-      SUM(CASE WHEN t.attempts = 1 AND t.good = 1 THEN 1 ELSE 0 END)     AS firstTime,
+      -- NO ATTEMPT is the warehouse system's own outstanding flag on the stop,
+      -- not "this order has no stop row". Those are different things: a stop can
+      -- exist, be planned, and never be attempted, which is exactly the case the
+      -- client cares about. Counting missing rows reported 113 for August where
+      -- the real answer is 44.
+      SUM(t.outstanding)                                                 AS noAttempt,
+      -- FIRST TIME SUCCESSFUL is completed AND delivered on time. It has nothing
+      -- to do with how many attempts were made — that was my assumption, and it
+      -- counted 7,294 August orders where the client's own figure is 5,485. The
+      -- extract carries DelOnTimeFlag for precisely this.
+      SUM(CASE WHEN t.done = 1 AND t.onTime = 1 THEN 1 ELSE 0 END)       AS firstTime,
       COUNT(*)                                                           AS scopedOrders
     FROM (
       SELECT YEAR(${oDate(S, 'o')}) AS y, MONTH(${oDate(S, 'o')}) AS m,
              o.${ident(S.o_id)} AS oid,
              COUNT(a.${ident(S.a_order)}) AS attempts,
-             SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0)) AS good
+             SUM(COALESCE(${aliasCol('a', S.a_okFlag)}, 0)) AS good,
+             SUM(COALESCE(${aliasCol('a', S.a_outstandFlag)}, 0)) AS outstanding,
+             MAX(COALESCE(${aliasCol('o', S.o_completeFlag)}, 0)) AS done,
+             MAX(COALESCE(${aliasCol('o', S.o_delOnTimeFlag)}, 0)) AS onTime
       FROM ${ident(S.orders)} o
       LEFT JOIN ${ident(S.attempts)} a ON a.${ident(S.a_order)} = o.${ident(S.o_id)}
       ${oScoped.where}
