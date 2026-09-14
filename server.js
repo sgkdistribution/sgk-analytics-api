@@ -527,6 +527,12 @@ app.get('/analytics/overview', async (req, res) => {
 
     const startedAt = Date.now();
     const { value: roll, builtAt } = await cached(yearKey, () => Q.yearRollup(f));
+    // Bucketed by the client's own delivery dates. Cached on its own key because
+    // it honours the month filter, which the year rollup deliberately does not.
+    const deliveryCounts = sqlConfigured()
+      ? await cached(`del:${yearKeyFor(f)}:${f.month || 'all'}`,
+          () => Q.deliveryOrderCounts(f)).then((r) => r.value).catch(() => null)
+      : null;
     const facets = await facetsPromise;
     // Cold builds are the only ones that touch the database now. Logged so a
     // slow year is visible without anyone having to reproduce it.
@@ -601,8 +607,13 @@ app.get('/analytics/overview', async (req, res) => {
     const data = {
       orders: {
         totalSales: num(totals.sales),
-        totalOrders: totals.orders,
-        completedOrders: totals.completed,
+        // The client's report buckets these two by OrderConfirmedDate and
+        // OrderCompletedDate. deliveryOrderCounts returns null when that is
+        // switched off or the columns are absent, and the OrderDate figures
+        // stand — the page never blanks because of it.
+        totalOrders: deliveryCounts?.totalOrders ?? totals.orders,
+        completedOrders: deliveryCounts?.completedOrders ?? totals.completed,
+        orderCountBasis: deliveryCounts ? 'confirmed/completed date (matches Power BI)' : 'order date',
         avgWeightKg: num(meanOf(totals.weightSum, totals.weightCnt)),
         avgCubeM3: num(meanOf(totals.cubeSum, totals.cubeCnt)),
         avgItemsPerOrder: num(meanOf(totals.itemsSum, totals.itemsCnt)),

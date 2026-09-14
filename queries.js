@@ -178,9 +178,12 @@ function pushDateConds(conds, params, d, f) {
   if (f.to)   { conds.push(`${d} < DATE_ADD(:toDate, INTERVAL 1 DAY)`); params.toDate = f.to; }
 }
 
-function orderFilter(S, f, alias = '') {
+function orderFilter(S, f, alias = '', dateCol = null) {
   const p = alias ? `${alias}.` : '';
-  const d = oDate(S, alias);
+  // dateCol lets the delivery page bucket by OrderConfirmedDate/OrderCompletedDate
+  // while every other caller keeps the default OrderDate — one filter builder, so
+  // the client-key isolation is identical on all of them.
+  const d = dateCol ? `${p}${ident(dateCol)}` : oDate(S, alias);
   const ck = clientKeys(f);
   const conds = [`${p}${ident(S.o_client)} IN (${ck.placeholders})`];
   const params = { ...ck.params };
@@ -654,6 +657,41 @@ export async function reconcile(f) {
     byMonth: byMonthRows,
     byPartner: byPartnerRows,
   };
+}
+
+// ---------------------------------------------------------------------------
+// DELIVERY-PAGE ORDER COUNTS — bucketed by the dates the client's own report uses.
+//
+// The Orders & Sales page counts an order in the month it was PLACED
+// (OrderDate). The client's Power BI delivery page does not: it counts Total
+// Orders by the month the order was CONFIRMED, and Completed Orders by the month
+// it was COMPLETED. Proven against August 2026 — 8,113 and 7,822, both exact.
+//
+// ⚠️ THE CONSEQUENCE, STATED OUT LOUD: the two tabs of this portal will now
+// report different order counts for the same month — 7,879 on Orders & Sales,
+// 8,113 on Delivery performance. That is not a fault, it is two honest answers
+// to two different questions, and it is exactly what the client's report already
+// does. It is on a switch for that reason: set DELIVERY_DATE_BASIS=order to put
+// the delivery page back on OrderDate and make both tabs agree with each other
+// instead of with Power BI.
+// ---------------------------------------------------------------------------
+const DELIVERY_BASIS = String(process.env.DELIVERY_DATE_BASIS || 'powerbi').toLowerCase();
+export const deliveryBasis = () => DELIVERY_BASIS;
+
+export async function deliveryOrderCounts(f) {
+  const S = await resolveSchema();
+  if (DELIVERY_BASIS === 'order' || !has(S.o_confirmedDate) || !has(S.o_completedDate)) return null;
+
+  // Each count gets its own date filter — same client keys, same service, same
+  // window, different column. Built through orderFilter so the client-key
+  // isolation can never drift away from the rest of the service.
+  const totalF = orderFilter(S, f, '', S.o_confirmedDate);
+  const doneF = orderFilter(S, f, '', S.o_completedDate);
+  const [t, d] = await Promise.all([
+    query(`SELECT COUNT(DISTINCT ${ident(S.o_id)}) AS n FROM ${ident(S.orders)} ${totalF.where}`, totalF.params),
+    query(`SELECT SUM(COALESCE(${col(S.o_completeFlag)}, 0)) AS n FROM ${ident(S.orders)} ${doneF.where}`, doneF.params),
+  ]);
+  return { totalOrders: Number(t[0]?.n || 0), completedOrders: Number(d[0]?.n || 0) };
 }
 
 // Every PartnerName in the extract, with how many orders each has. This is what
