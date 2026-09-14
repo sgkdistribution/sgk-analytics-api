@@ -69,6 +69,10 @@ export const CONFIGURED = {
   orders:         env('SQL_ORDERS_TABLE', 'orders'),
   o_client:       env('SQL_ORDERS_CLIENT_COL', 'PartnerName'),
   o_id:           env('SQL_ORDERS_ID_COL', 'OrderID'),
+  // The human-facing order reference. NOT used for any figure — it exists only
+  // so /analytics/reconcile can reproduce Power BI's "Count of Order Number"
+  // slice exactly and show where a remaining difference comes from.
+  o_number:       env('SQL_ORDERS_NUMBER_COL', 'OrderNumber'),
   o_value:        env('SQL_ORDERS_VALUE_COL', 'OrderCharges'),      // what the client is charged
   o_weight:       env('SQL_ORDERS_WEIGHT_COL', 'OrderWeight'),
   o_cube:         env('SQL_ORDERS_CUBE_COL', 'OrderCube'),
@@ -113,6 +117,7 @@ const ALIASES = {
   orders:         ['orders', 'Orders', 'order', 'sgk_orders', 'orders_extract', 'vw_orders', 'v_orders'],
   o_client:       ['PartnerName', 'ClientCode', 'ClientName', 'PartnerCode', 'Partner', 'Client', 'CustomerName', 'AccountName'],
   o_id:           ['OrderID', 'OrderId', 'Order_ID', 'OrderNo', 'OrderNumber', 'OrderRef'],
+  o_number:       ['OrderNumber', 'OrderNo', 'OrderRef', 'OrderReference', 'CustomerOrderNumber'],
   o_value:        ['OrderCharges', 'OrderValue', 'OrderCharge', 'Charges', 'TotalCharges', 'OrderNetValue', 'NetValue', 'OrderPrice'],
   o_weight:       ['OrderWeight', 'WeightKg', 'Weight', 'TotalWeight', 'OrderWeightKg'],
   o_cube:         ['OrderCube', 'CubeM3', 'Cube', 'TotalCube', 'OrderVolume', 'Volume'],

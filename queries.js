@@ -75,11 +75,37 @@ function clientKeys(f) {
   return { placeholders: names.join(', '), params };
 }
 
-// Cancelled orders are not revenue and were never delivered, so they are left
-// out of every figure. Set SQL_ORDERS_EXCLUDE_STATUSES to '' to include them,
-// or add more comma-separated statuses to exclude.
-const EXCLUDED = String(process.env.SQL_ORDERS_EXCLUDE_STATUSES ?? 'Cancelled')
+// ---------------------------------------------------------------------------
+// WHICH ORDERS COUNT — and why this now defaults to "all of them".
+//
+// THE BUG THIS LINE CAUSED. This used to default to 'Cancelled', so every figure
+// on the dashboard was computed over the orders table MINUS its cancelled rows.
+// The Power BI report the same client is shown is built straight off the same
+// table with no such filter. Two reports, same database, different row
+// populations — so every single number disagreed, by a little, in every month,
+// for ever. On Roseland's 2026 that was about 1,600 orders and £2,100 of sales
+// missing from the portal, which is small enough to look like a rounding fault
+// and is nothing of the sort.
+//
+// Nothing about the old behaviour was unreasonable in itself — a cancelled order
+// is not revenue. It was simply a DIFFERENT question from the one the client's
+// other report answers, decided here in code, and never stated on screen. When
+// two reports have to agree, the one that silently drops rows is the wrong one.
+//
+// So the default is now EMPTY: the portal reads the orders table exactly as
+// Power BI reads it, and the two reconcile to the penny.
+//
+// To go back to excluding cancelled orders, set the environment variable
+//   SQL_ORDERS_EXCLUDE_STATUSES=Cancelled
+// (comma-separate for more than one). Whatever is in force is reported on
+// /health and on /analytics/reconcile, so it can never be a silent difference
+// again.
+// ---------------------------------------------------------------------------
+const EXCLUDED = String(process.env.SQL_ORDERS_EXCLUDE_STATUSES ?? '')
   .split(',').map((x) => x.trim()).filter(Boolean);
+
+/** What is being left out of every figure, for /health and the reconciliation. */
+export const excludedStatuses = () => [...EXCLUDED];
 
 function excludeClause(S, alias, params) {
   // No status column in the extract any more means nothing to exclude ON. Left
@@ -88,7 +114,21 @@ function excludeClause(S, alias, params) {
   if (!EXCLUDED.length || !has(S.o_statusName)) return '';
   const p = alias ? `${alias}.` : '';
   EXCLUDED.forEach((v, i) => { params[`ex${i}`] = v; });
-  return ` AND ${p}${ident(S.o_statusName)} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')})`;
+  const c = `${p}${ident(S.o_statusName)}`;
+  // THE `IS NULL` HALF IS NOT DEFENSIVE PADDING — it is a second, separate bug.
+  //
+  // In SQL, `NULL NOT IN ('Cancelled')` does not evaluate to TRUE. It evaluates
+  // to NULL, which a WHERE clause treats exactly like FALSE, so EVERY order with
+  // no status at all was being thrown away as well — silently, and for a reason
+  // nobody wrote down or intended. An order with a blank status is still an
+  // order, still has a value, and belongs in the totals.
+  return ` AND (${c} IS NULL OR ${c} NOT IN (${EXCLUDED.map((_, i) => `:ex${i}`).join(', ')}))`;
+}
+
+/** The same predicate as a standalone expression, for the reconciliation. */
+function keepExpr(S, alias, params) {
+  const clause = excludeClause(S, alias, params);
+  return clause ? clause.replace(/^ AND /, '') : '1 = 1';
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +192,18 @@ function orderFilter(S, f, alias = '') {
   // quietly emptying the dashboard.
   if (f.service && has(S.o_service)) { conds.push(`${p}${ident(S.o_service)} = :service`); params.service = String(f.service); }
 
-  return { where: `WHERE ${conds.join(' AND ')}${excludeClause(S, alias, params)}`, params, date: d };
+  // `whereEveryStatus` is the SAME filter — same client, same dates, same
+  // service — with only the status exclusion left off. The reconciliation needs
+  // to read the table the way Power BI reads it, and building it here rather
+  // than writing a second filter function is the only way the two can never
+  // drift apart on the part that actually matters: the client key.
+  const base = `WHERE ${conds.join(' AND ')}`;
+  return {
+    where: `${base}${excludeClause(S, alias, params)}`,
+    whereEveryStatus: base,
+    params,
+    date: d,
+  };
 }
 
 // stops carry their own PartnerName and ServiceLevelName, so no join is needed.
@@ -474,6 +525,99 @@ export async function facets(clientKey) {
   return {
     years: years.map((r) => Number(r.y)).filter(Boolean),
     serviceLevels: services.map((r) => String(r.s)).filter(Boolean),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RECONCILIATION — "why does the portal say 70,154 and Power BI say 71,751?"
+//
+// This answers that question from the client's own data instead of from anyone's
+// reasoning about it. For one client and one year it reads the orders table
+// THREE ways at once:
+//
+//   1. AS POWER BI READS IT — every row, no exclusions of any kind. This is the
+//      target the dashboard has to match.
+//   2. AS THE DASHBOARD READS IT — the same rows with whatever
+//      SQL_ORDERS_EXCLUDE_STATUSES is set to actually applied.
+//   3. BROKEN DOWN BY OrderStatus, including the rows that have no status at
+//      all — so a difference is never "somewhere in the data", it is
+//      "419 Cancelled orders worth £612.40, in March".
+//
+// It also counts the rows FOUR different ways side by side, because Power BI's
+// two visuals do not count the same thing and neither of them is COUNT(*):
+//
+//   COUNT(*)                  every row
+//   COUNT(DISTINCT OrderID)   what the portal's "orders" figure is
+//   COUNT(OrderItemsCount)    what Power BI's monthly "Count of OrderItemsCount"
+//                             column is — it skips rows where that field is blank
+//   COUNT(OrderNumber)        what Power BI's "Count of Order Number" pie is
+//
+// If those four are not all equal, the two reports will differ by that amount
+// however correct both of them are, and this is where you see it rather than
+// arguing about it.
+//
+// SGK staff only — it names statuses and partner keys.
+// ---------------------------------------------------------------------------
+export async function reconcile(f) {
+  const S = await resolveSchema();
+  const statusCol = has(S.o_statusName) ? ident(S.o_statusName) : null;
+  const statusExpr = statusCol ? `COALESCE(${statusCol}, '(no status)')` : `'(no status column)'`;
+
+  // Counted four ways, once, so the same expressions are used everywhere below.
+  const counts = `
+      COUNT(*)                            AS rowsAll,
+      COUNT(DISTINCT ${ident(S.o_id)})    AS distinctOrderIds,
+      COUNT(${col(S.o_items)})            AS rowsWithItemsCount,
+      COUNT(${col(S.o_number)})           AS rowsWithOrderNumber,
+      SUM(${col(S.o_value)})              AS sales`;
+
+  // ONE filter, built once, reused by all three reads. `whereEveryStatus` is the
+  // client/date/service filter with the status exclusion left off — Power BI's
+  // view of the table — and `keep` re-expresses the exclusion as a CASE so both
+  // readings come out of the SAME scan and cannot disagree about anything else.
+  const ff = orderFilter(S, { ...f, month: null });
+  const params = { ...ff.params };
+  const keep = keepExpr(S, '', params);
+
+  // 1 + 3. Everything, split by status.
+  const byStatus = await query(`
+    SELECT ${statusExpr} AS orderStatus, ${counts},
+      MAX(CASE WHEN ${keep} THEN 1 ELSE 0 END) AS keptByDashboard
+    FROM ${ident(S.orders)}
+    ${ff.whereEveryStatus}
+    GROUP BY ${statusExpr}
+    ORDER BY rowsAll DESC
+  `, params);
+
+  // 2. Month by month, both readings side by side — this is the table to put
+  //    next to the Power BI monthly summary.
+  const byMonthRows = await query(`
+    SELECT YEAR(${ff.date}) AS y, MONTH(${ff.date}) AS m, ${counts},
+      SUM(CASE WHEN ${keep} THEN 1 ELSE 0 END)                                  AS dashboardRows,
+      SUM(CASE WHEN ${keep} THEN COALESCE(${col(S.o_value)}, 0) ELSE 0 END)     AS dashboardSales
+    FROM ${ident(S.orders)}
+    ${ff.whereEveryStatus}
+    GROUP BY YEAR(${ff.date}), MONTH(${ff.date})
+    ORDER BY y, m
+  `, params);
+
+  // Partner split — the pie, both readings.
+  const byPartnerRows = await query(`
+    SELECT ${ident(S.o_client)} AS partner, ${counts},
+      SUM(CASE WHEN ${keep} THEN 1 ELSE 0 END) AS dashboardRows
+    FROM ${ident(S.orders)}
+    ${ff.whereEveryStatus}
+    GROUP BY ${ident(S.o_client)}
+    ORDER BY rowsAll DESC
+  `, params);
+
+  return {
+    excluding: excludedStatuses(),
+    statusColumn: has(S.o_statusName) ? S.o_statusName : null,
+    orderNumberColumn: has(S.o_number) ? S.o_number : null,
+    byStatus,
+    byMonth: byMonthRows,
+    byPartner: byPartnerRows,
   };
 }
 

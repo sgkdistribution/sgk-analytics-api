@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 import express from 'express';
 import { verifyToken, authConfigured } from './auth.js';
-import { resolveCompany, listCompanies, isSgk, describeAccess } from './clients.js';
+import { resolveCompany, listCompanies, isSgk, describeAccess, clientMap } from './clients.js';
 import { sqlConfigured, ping } from './db.js';
 import { resolveSchema, schemaReport, forgetSchema } from './schema.js';
 import * as Q from './queries.js';
@@ -68,7 +68,39 @@ app.use((req, res, next) => {
 // serve one company's figures to another.
 // ---------------------------------------------------------------------------
 const TTL = Number(process.env.CACHE_TTL_MS || 120000);
-const STALE_MAX = Number(process.env.CACHE_STALE_MS || 900000);   // 15 minutes
+
+// ---------------------------------------------------------------------------
+// THE SCHEDULED REFRESH — the service now goes and gets the figures ON ITS OWN.
+//
+// WHAT IT USED TO DO. Nothing, on its own. The database was read only when
+// somebody opened the dashboard, and the answer was reused for CACHE_TTL_MS.
+// That is fine for accuracy — nothing was ever stale by more than a few minutes
+// while a person was actually looking — but it has two real costs:
+//
+//   * THE FIRST VISITOR OF THE DAY PAYS FOR IT. A cold cache is three reads
+//     across a warehouse extract, and they wait for all of it.
+//   * NOTHING WAS EVER PULLED IN ADVANCE. "How current is this?" had no answer
+//     other than "as current as whoever last opened it made it".
+//
+// So the service now refreshes every company on a timer, whether anyone is
+// looking or not. Default every 30 MINUTES; set REFRESH_EVERY_MS to change it
+// (3600000 for hourly), or 0 to turn the timer off and go back to reading only
+// on demand.
+// ---------------------------------------------------------------------------
+const REFRESH_MS = Math.max(0, Number(process.env.REFRESH_EVERY_MS ?? 1800000));   // 30 minutes
+
+// HOW OLD A CACHED ANSWER MAY BE BEFORE SOMEBODY HAS TO WAIT FOR A REBUILD.
+//
+// This has to be COMFORTABLY LONGER than the refresh interval, and that is not a
+// detail. If the stale window were shorter than the gap between refreshes, there
+// would be a stretch at the end of every cycle where the timer had not fired yet
+// but the cached answer had already aged out — and whoever opened the dashboard
+// in that gap would sit through a full cold rebuild, which is the exact wait the
+// timer exists to remove. At twice the interval there is no such gap: the timer
+// always gets there first, and the stale window is only ever reached if the
+// refresh itself has been failing.
+const STALE_MAX = Number(process.env.CACHE_STALE_MS || Math.max(900000, REFRESH_MS * 2));
+
 const cache = new Map();
 const inFlight = new Map();
 
@@ -116,21 +148,50 @@ async function cachedLong(key, fn) {
   return build(key, fn);
 }
 
+/**
+ * Returns `{ value, builtAt }` — NOT just the value, and the second half matters.
+ *
+ * THE BUG IT FIXES. The response carried `generatedAt: new Date()`, set at the
+ * moment of replying, and the dashboard prints that as "updated 11:21". So a set
+ * of figures read from the database fourteen minutes ago was labelled on screen
+ * as if it had just been fetched. Every question of the form "is this current?"
+ * got a confidently wrong answer, and when the portal and Power BI disagreed the
+ * timestamp actively argued against staleness being worth checking.
+ *
+ * The cache has always known when each entry was really built. It just never
+ * told anyone.
+ */
 const cached = async (key, fn) => {
   const hit = cache.get(key);
   const age = hit ? Date.now() - hit.at : Infinity;
 
-  if (hit && age < TTL) return hit.value;
+  if (hit && age < TTL) return { value: hit.value, builtAt: hit.at };
 
   if (hit && age < STALE_MAX) {
     // Serve now, refresh behind. The catch matters: an unhandled rejection here
     // would take the process down for a refresh nobody was waiting on.
     build(key, fn).catch((e) => console.warn('[analytics] background refresh failed:', e?.message || e));
-    return hit.value;
+    return { value: hit.value, builtAt: hit.at };
   }
 
-  return build(key, fn);
+  const value = await build(key, fn);
+  return { value, builtAt: cache.get(key)?.at ?? Date.now() };
 };
+
+/**
+ * THE CACHE KEY FOR ONE CLIENT-YEAR — in ONE place.
+ *
+ * The request path and the scheduled refresh must produce byte-for-byte the same
+ * key or the timer warms an entry nobody reads and every visitor still waits for
+ * a cold build, with nothing anywhere looking broken. `JSON.stringify` is
+ * order-sensitive, so "both files build the same object" is not good enough —
+ * they have to call the same function.
+ */
+const yearKeyFor = (f) => JSON.stringify({
+  clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service,
+});
+
+const facetsKeyFor = (sqlKey) => `facets:${JSON.stringify(sqlKey)}`;
 
 /**
  * Does this error mean "the table is not the shape I was told it was"?
@@ -159,12 +220,22 @@ app.get('/health', async (_req, res) => {
     try { await resolveSchema(); } catch { /* the report below carries the reason */ }
     schema = schemaReport();
   }
+  const excluding = Q.excludedStatuses();
   res.json({
     ok: true,
     db,
     schema,
     auth: authConfigured() ? 'configured' : 'not configured',
     clients: listCompanies().length,
+    // ONE LOOK ANSWERS "IS IT DROPPING ROWS?". This is the setting that made the
+    // portal and Power BI disagree on every figure for months, and the only
+    // reason it went unnoticed for so long is that nothing anywhere said it was
+    // switched on. Now it does.
+    figures: excluding.length
+      ? `EXCLUDING orders with status: ${excluding.join(', ')} — these figures will NOT match a Power BI report built on the same table. Unset SQL_ORDERS_EXCLUDE_STATUSES to match it.`
+      : 'every order counted, no status excluded — matches a Power BI report built on the same table',
+    excludingOrderStatuses: excluding,
+    refresh: refreshStatus(),
     ...(demoEnabled() ? { demo: 'ON — serving frozen sample data, not live figures' } : {}),
   });
 });
@@ -224,6 +295,133 @@ app.get('/analytics/diag/durations', async (req, res) => {
       howToRead: 'Pick the line that gives a believable delivery time. If that is not "ifSeconds", set SQL_DURATION_UNIT in /etc/sgk-analytics.env and restart.',
     });
   } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// RECONCILIATION — SGK staff only.
+//
+//   GET /analytics/reconcile?company=<id|name>&year=2026
+//
+// The answer to "the portal says £2,753,206.98 and Power BI says £2,755,325.58,
+// which one is wrong and why". It reads the orders table BOTH ways in one pass —
+// every row, and the rows the dashboard keeps — and prints the difference broken
+// down by order status, by month and by partner.
+//
+// It is not a guess-checker: the numbers come out of the client's own data, so
+// the difference is always attributed to something with a name and a count
+// rather than to "something in the data". If the two figures on the last line
+// are equal, the dashboard and Power BI are reading the same table the same way
+// and any remaining difference is in the Power BI file, not here.
+// ---------------------------------------------------------------------------
+app.get('/analytics/reconcile', async (req, res) => {
+  try {
+    const identity = await verifyToken(req.headers.authorization);
+    if (!isSgk(identity)) return res.status(403).json({ error: 'SGK staff only.' });
+    if (!sqlConfigured()) return res.status(503).json({ error: 'The analytics database is not connected yet.' });
+    const { company } = resolveCompany(identity, { companyId: req.query.company, companyName: req.query.companyName });
+    if (!company) return res.json({ needsCompany: true, companies: listCompanies() });
+
+    const f = {
+      clientKey: company.sqlKey,
+      year: req.query.year ? Number(req.query.year) : null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      service: req.query.service || null,
+    };
+
+    const r = await Q.reconcile(f);
+    const n = (v) => Number(v || 0);
+
+    const everything = r.byStatus.reduce((a, s) => ({
+      rows: a.rows + n(s.rowsAll),
+      distinctOrderIds: a.distinctOrderIds + n(s.distinctOrderIds),
+      withItemsCount: a.withItemsCount + n(s.rowsWithItemsCount),
+      withOrderNumber: a.withOrderNumber + n(s.rowsWithOrderNumber),
+      sales: a.sales + n(s.sales),
+    }), { rows: 0, distinctOrderIds: 0, withItemsCount: 0, withOrderNumber: 0, sales: 0 });
+
+    const dashboard = r.byMonth.reduce((a, m) => ({
+      rows: a.rows + n(m.dashboardRows),
+      sales: a.sales + n(m.dashboardSales),
+    }), { rows: 0, sales: 0 });
+
+    const dropped = {
+      orders: everything.rows - dashboard.rows,
+      sales: Number((everything.sales - dashboard.sales).toFixed(2)),
+      becauseOfStatus: r.byStatus
+        .filter((s) => !Number(s.keptByDashboard))
+        .map((s) => ({ status: s.orderStatus, orders: n(s.rowsAll), sales: Number(n(s.sales).toFixed(2)) })),
+    };
+
+    res.json({
+      company: { id: company.companyId, name: company.name },
+      partnerKeys: company.sqlKey,
+      filters: f,
+      statusColumn: r.statusColumn,
+      excludingOrderStatuses: r.excluding,
+
+      // WHAT POWER BI SEES — the whole table for this client and period.
+      powerBiView: {
+        orders: everything.rows,
+        distinctOrderIds: everything.distinctOrderIds,
+        // Power BI's monthly summary column is "Count of OrderItemsCount" and its
+        // pie is "Count of Order Number". NEITHER of them is a row count: both
+        // skip rows where that one field happens to be blank. If these two are
+        // lower than `orders` below, Power BI is under-counting by that much and
+        // no change here will ever close the gap.
+        countOfOrderItemsCount: everything.withItemsCount,
+        countOfOrderNumber: everything.withOrderNumber,
+        sales: Number(everything.sales.toFixed(2)),
+      },
+
+      // WHAT THE DASHBOARD SHOWS, with the exclusions that are actually in force.
+      dashboardView: { orders: dashboard.rows, sales: Number(dashboard.sales.toFixed(2)) },
+
+      difference: dropped,
+
+      verdict: dropped.orders === 0 && Math.abs(dropped.sales) < 0.005
+        ? (everything.rows === everything.withItemsCount && everything.rows === everything.withOrderNumber
+          ? 'MATCHED — the dashboard reads every row Power BI reads, and Power BI is counting every row too.'
+          : 'MATCHED on rows and money. Any remaining difference is Power BI counting a COLUMN rather than rows: '
+            + `${everything.rows - everything.withItemsCount} rows have no OrderItemsCount and `
+            + `${everything.rows - everything.withOrderNumber} have no Order Number, so its visuals will read that much lower.`)
+        : `NOT MATCHED — the dashboard is leaving out ${dropped.orders} orders worth £${dropped.sales.toFixed(2)}, `
+          + `because SQL_ORDERS_EXCLUDE_STATUSES is set to "${r.excluding.join(', ')}". Unset it to match Power BI.`,
+
+      byStatus: r.byStatus.map((s) => ({
+        status: s.orderStatus,
+        keptByDashboard: Boolean(Number(s.keptByDashboard)),
+        orders: n(s.rowsAll),
+        distinctOrderIds: n(s.distinctOrderIds),
+        countOfOrderItemsCount: n(s.rowsWithItemsCount),
+        countOfOrderNumber: n(s.rowsWithOrderNumber),
+        sales: Number(n(s.sales).toFixed(2)),
+      })),
+
+      byMonth: r.byMonth.map((m) => ({
+        month: `${MONTHS[Number(m.m) - 1]} ${m.y}`,
+        powerBiOrders: n(m.rowsAll),
+        powerBiCountOfOrderItemsCount: n(m.rowsWithItemsCount),
+        powerBiSales: Number(n(m.sales).toFixed(2)),
+        dashboardOrders: n(m.dashboardRows),
+        dashboardSales: Number(n(m.dashboardSales).toFixed(2)),
+        orderDifference: n(m.rowsAll) - n(m.dashboardRows),
+        salesDifference: Number((n(m.sales) - n(m.dashboardSales)).toFixed(2)),
+      })),
+
+      byPartner: r.byPartner.map((p) => ({
+        partner: p.partner,
+        powerBiOrders: n(p.rowsAll),
+        powerBiCountOfOrderNumber: n(p.rowsWithOrderNumber),
+        dashboardOrders: n(p.dashboardRows),
+        difference: n(p.rowsAll) - n(p.dashboardRows),
+      })),
+    });
+  } catch (e) {
+    if ((e.status || 500) >= 500) console.error('[analytics] reconcile failed:', e?.message || e);
+    if (isSchemaDrift(e)) forgetSchema();
     res.status(e.status || 500).json({ error: e.message });
   }
 });
@@ -297,9 +495,9 @@ app.get('/analytics/overview', async (req, res) => {
     // cached year is the entire point — putting the month back in would restore
     // the old behaviour without anything looking wrong.
     // -----------------------------------------------------------------------
-    const yearKey = JSON.stringify({ clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service });
+    const yearKey = yearKeyFor(f);
 
-    const facetsKey = `facets:${JSON.stringify(company.sqlKey)}`;
+    const facetsKey = facetsKeyFor(company.sqlKey);
     // -----------------------------------------------------------------------
     // THE .catch() BELOW IS NOT TIDINESS. It is the reason the dashboard used to
     // say "Failed to fetch" instead of saying what was actually wrong.
@@ -328,7 +526,7 @@ app.get('/analytics/overview', async (req, res) => {
       });
 
     const startedAt = Date.now();
-    const roll = await cached(yearKey, () => Q.yearRollup(f));
+    const { value: roll, builtAt } = await cached(yearKey, () => Q.yearRollup(f));
     const facets = await facetsPromise;
     // Cold builds are the only ones that touch the database now. Logged so a
     // slow year is visible without anyone having to reproduce it.
@@ -450,7 +648,16 @@ app.get('/analytics/overview', async (req, res) => {
       // Says out loud how the duration columns were read. An assumption on screen
       // gets questioned; an assumption in a comment does not.
       durationUnit: configuredUnit(),
-      generatedAt: new Date().toISOString(),
+      // WHEN THE DATABASE WAS ACTUALLY READ — not when this reply was written.
+      // The dashboard prints this as "updated HH:MM", so it has to be the truth
+      // about the figures rather than the truth about the HTTP response.
+      generatedAt: new Date(builtAt).toISOString(),
+      dataAgeSeconds: Math.max(0, Math.round((Date.now() - builtAt) / 1000)),
+      servedAt: new Date().toISOString(),
+      refreshEvery: REFRESH_MS ? everyText(REFRESH_MS) : null,
+      // What is being left out of these figures, if anything. Empty means the
+      // orders table is read exactly as Power BI reads it.
+      excludingOrderStatuses: Q.excludedStatuses(),
       ...data,
     });
   } catch (e) {
@@ -485,6 +692,119 @@ app.get('/analytics/overview', async (req, res) => {
 // request that caused it has already had its own error handled and answered;
 // staying up means the next request gets a real answer instead of a dead socket.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// THE SCHEDULED REFRESH
+//
+// Every REFRESH_EVERY_MS (30 minutes by default) this walks every company in
+// CLIENT_MAP and rebuilds the entry the dashboard actually asks for: the CURRENT
+// YEAR, no month, no service filter — which is exactly what the page requests
+// when it opens, because the filters start at `{ year: new Date().getFullYear() }`.
+//
+// Three things make it safe to leave running:
+//
+//   ONE COMPANY AT A TIME, with a pause between. This is a guest in a database
+//   the business depends on. Three companies × three reads, spread out, twice an
+//   hour, is nothing; the same work fired all at once twice an hour is a spike
+//   for no reason.
+//
+//   IT WRITES STRAIGHT INTO THE CACHE via build(), not through cached(). Going
+//   through cached() would find a fresh entry and decide there was nothing to do
+//   — the timer would run, log success, and never actually read the database.
+//
+//   A FAILURE CHANGES NOTHING. The old figures stay in the cache and keep being
+//   served; the failure is logged and shows on /health. A refresh that cannot
+//   reach the database must never blank a dashboard that was working.
+// ---------------------------------------------------------------------------
+let refreshState = { lastRun: null, lastOk: null, lastError: null, companies: 0, running: false };
+
+/** "30 minutes" / "45 seconds" — never "0 minutes", which is what rounding a
+ *  sub-minute interval down produced on the diagnostic page. */
+const everyText = (ms) => (ms < 60000 ? `${Math.round(ms / 1000)} seconds` : `${Math.round(ms / 60000)} minutes`);
+
+export function refreshStatus() {
+  if (!REFRESH_MS) return 'off — figures are read on demand only (set REFRESH_EVERY_MS to schedule it)';
+  return {
+    every: everyText(REFRESH_MS),
+    everyMinutes: REFRESH_MS / 60000,
+    lastRun: refreshState.lastRun,
+    lastResult: refreshState.lastError
+      ? `failed: ${refreshState.lastError}`
+      : refreshState.lastOk
+        ? `refreshed ${refreshState.companies} ${refreshState.companies === 1 ? 'company' : 'companies'}`
+        : 'not run yet',
+    servingFiguresUpToMinutesOld: Math.round(STALE_MAX / 60000),
+  };
+}
+
+async function refreshOne(company) {
+  const f = {
+    clientKey: company.sqlKey,
+    year: new Date().getFullYear(),
+    month: null,
+    from: null,
+    to: null,
+    service: null,
+  };
+  // Same key builders as the request path — see yearKeyFor().
+  await build(yearKeyFor(f), () => Q.yearRollup(f));
+  await build(facetsKeyFor(company.sqlKey), () => Q.facets(company.sqlKey));
+}
+
+async function refreshAll() {
+  if (refreshState.running) return;              // a slow cycle must not overlap the next
+  refreshState.running = true;
+  const started = Date.now();
+  let done = 0;
+  let firstError = null;
+  try {
+    for (const company of clientMap()) {
+      try {
+        await refreshOne(company);
+        done += 1;
+      } catch (e) {
+        // One client's figures failing must not stop the others being refreshed.
+        firstError = firstError || `${company.name}: ${e?.message || e}`;
+        console.warn(`[refresh] ${company.name} failed:`, e?.message || e);
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    refreshState = {
+      ...refreshState,
+      lastRun: new Date().toISOString(),
+      lastOk: !firstError,
+      lastError: firstError,
+      companies: done,
+    };
+    console.log(`[refresh] ${done}/${clientMap().length} companies refreshed in ${Date.now() - started}ms`);
+  } finally {
+    refreshState.running = false;
+  }
+}
+
+function startScheduledRefresh() {
+  if (!REFRESH_MS) {
+    console.log('[refresh] scheduled refresh is OFF (REFRESH_EVERY_MS=0) — figures are read on demand only');
+    return;
+  }
+  if (!sqlConfigured()) {
+    console.warn('[refresh] MySQL is not configured — the scheduled refresh will not run');
+    return;
+  }
+  if (demoEnabled()) {
+    console.warn('[refresh] DEMO_MODE is on — the scheduled refresh is pointless and will not run');
+    return;
+  }
+  if (!clientMap().length) {
+    console.warn('[refresh] CLIENT_MAP is empty — nothing to refresh');
+    return;
+  }
+  console.log(`[refresh] every ${everyText(REFRESH_MS)}, for ${clientMap().length} companies`);
+  // Warm on boot so the first person in is not the one who pays for a cold
+  // cache, but a few seconds after listening so a deploy answers /health at once.
+  setTimeout(() => { refreshAll().catch((e) => console.error('[refresh] failed:', e?.message || e)); }, 5000).unref();
+  setInterval(() => { refreshAll().catch((e) => console.error('[refresh] failed:', e?.message || e)); }, REFRESH_MS).unref();
+}
+
 process.on('unhandledRejection', (reason) => {
   console.error('[analytics] unhandled promise rejection (service kept running):', reason?.message || reason);
 });
@@ -495,6 +815,14 @@ process.on('uncaughtException', (err) => {
 app.listen(PORT, () => {
   console.log(`[analytics] listening on ${PORT}`);
   console.log(`[analytics] origins: ${ORIGINS.join(', ')}`);
+  const excluding = Q.excludedStatuses();
+  if (excluding.length) {
+    console.warn(`[analytics] ⚠ EXCLUDING orders with status: ${excluding.join(', ')} — these figures will NOT match `
+      + 'a Power BI report built on the same table. Unset SQL_ORDERS_EXCLUDE_STATUSES to match it.');
+  } else {
+    console.log('[analytics] counting every order, no status excluded — matches Power BI on the same table');
+  }
   if (!authConfigured()) console.warn('[analytics] COGNITO_USER_POOL_ID is not set — every request will be rejected.');
   if (!sqlConfigured()) console.warn('[analytics] MySQL is not configured — /analytics/overview will return 503.');
+  startScheduledRefresh();
 });
