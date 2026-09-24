@@ -3,7 +3,7 @@
 // served to the portal dashboards.
 //
 // One endpoint does the whole dashboard:
-//   GET /analytics/overview?year=&month=&from=&to=&service=[&company=]
+//   GET /analytics/overview?year=&month=&from=&to=&service=&orderType=[&company=]
 //
 // Every request: verify the Cognito token -> resolve the company SERVER SIDE ->
 // read only that company's rows. `company` is honoured for SGK staff only, and
@@ -188,10 +188,13 @@ const cached = async (key, fn) => {
  * they have to call the same function.
  */
 const yearKeyFor = (f) => JSON.stringify({
-  clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service,
+  clientKey: f.clientKey, year: f.year, from: f.from, to: f.to, service: f.service, orderType: f.orderType ?? null,
 });
 
 const facetsKeyFor = (sqlKey) => `facets:${JSON.stringify(sqlKey)}`;
+
+/** The Order type filter from the request: a plain string or nothing (a bound SQL value, never spliced in). */
+const orderTypeOf = (req) => (typeof req.query.orderType === 'string' && req.query.orderType.trim() ? req.query.orderType.trim().slice(0, 100) : null);
 
 /**
  * Does this error mean "the table is not the shape I was told it was"?
@@ -329,6 +332,7 @@ app.get('/analytics/reconcile', async (req, res) => {
       from: req.query.from || null,
       to: req.query.to || null,
       service: req.query.service || null,
+      orderType: orderTypeOf(req),
     };
 
     const r = await Q.reconcile(f);
@@ -457,6 +461,7 @@ app.get('/analytics/overview', async (req, res) => {
       from: req.query.from || null,
       to: req.query.to || null,
       service: req.query.service || null,
+      orderType: orderTypeOf(req),
     };
     // DEMO MODE. Note where this sits: AFTER the token has been verified and the
     // company resolved, so the same access rules apply. It is switched on only
@@ -473,7 +478,7 @@ app.get('/analytics/overview', async (req, res) => {
           company: { id: company.companyId, name: company.name },
           staff,
           demo: true,
-          filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
+          filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service, orderType: f.orderType },
           generatedAt: new Date().toISOString(),
           ...snapshot,
         });
@@ -522,7 +527,7 @@ app.get('/analytics/overview', async (req, res) => {
     const facetsPromise = cachedLong(facetsKey, () => Q.facets(company.sqlKey))
       .catch((e) => {
         console.warn('[analytics] facets failed — the dropdowns will be empty:', e?.message || e);
-        return { years: [], serviceLevels: [] };
+        return { years: [], serviceLevels: [], orderTypes: [] };
       });
 
     const startedAt = Date.now();
@@ -655,7 +660,7 @@ app.get('/analytics/overview', async (req, res) => {
     res.json({
       company: { id: company.companyId, name: company.name },
       staff,
-      filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service },
+      filters: { year: f.year, month: f.month, from: f.from, to: f.to, service: f.service, orderType: f.orderType },
       // Says out loud how the duration columns were read. An assumption on screen
       // gets questioned; an assumption in a comment does not.
       durationUnit: configuredUnit(),
@@ -755,6 +760,7 @@ async function refreshOne(company) {
     from: null,
     to: null,
     service: null,
+    orderType: null,
   };
   // Same key builders as the request path — see yearKeyFor().
   await build(yearKeyFor(f), () => Q.yearRollup(f));

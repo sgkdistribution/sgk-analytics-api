@@ -78,6 +78,7 @@ export const CONFIGURED = {
   o_cube:         env('SQL_ORDERS_CUBE_COL', 'OrderCube'),
   o_items:        env('SQL_ORDERS_ITEMS_COL', 'OrderItemsCount'),
   o_service:      env('SQL_ORDERS_SERVICE_COL', 'ServiceLevelName'),
+  o_orderType:    env('SQL_ORDERS_ORDER_TYPE_COL', 'OrderTypeName'),
   o_completeFlag: env('SQL_ORDERS_COMPLETE_FLAG', 'OrderStatusCompleteFlag'),
   // Order-level "delivered on time". This is what Power BI's "First Time
   // Successful Orders" is actually built on — NOT anything about attempts.
@@ -129,6 +130,7 @@ const ALIASES = {
   o_cube:         ['OrderCube', 'CubeM3', 'Cube', 'TotalCube', 'OrderVolume', 'Volume'],
   o_items:        ['OrderItemsCount', 'ItemCount', 'ItemsCount', 'OrderItems', 'Items', 'TotalItems', 'LineCount'],
   o_service:      ['ServiceLevelName', 'ServiceLevel', 'ServiceName', 'Service'],
+  o_orderType:    ['OrderTypeName', 'OrderType', 'OrderTypeDescription', 'OrderTypeDesc'],
   o_completeFlag: ['OrderStatusCompleteFlag', 'OrderCompleteFlag', 'OrderStatusComplete', 'CompleteFlag'],
   o_delOnTimeFlag: ['DelOnTimeFlag', 'DeliveredOnTimeFlag', 'OnTimeFlag', 'DelOnTime'],
   o_confirmedDate: ['OrderConfirmedDate', 'ConfirmedDate', 'OrderConfDate'],

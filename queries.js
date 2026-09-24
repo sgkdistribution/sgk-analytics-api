@@ -194,6 +194,8 @@ function orderFilter(S, f, alias = '', dateCol = null) {
   // never fires — but if one is passed by hand it is ignored rather than
   // quietly emptying the dashboard.
   if (f.service && has(S.o_service)) { conds.push(`${p}${ident(S.o_service)} = :service`); params.service = String(f.service); }
+  // Order type (Delivery / Pickup), the same way: no column, no filter, never an empty dashboard.
+  if (f.orderType && has(S.o_orderType)) { conds.push(`${p}${ident(S.o_orderType)} = :orderType`); params.orderType = String(f.orderType); }
 
   // `whereEveryStatus` is the SAME filter — same client, same dates, same
   // service — with only the status exclusion left off. The reconciliation needs
@@ -235,6 +237,7 @@ function attemptFilter(S, f) {
 
   pushDateConds(conds, params, d, f);
   if (f.service && has(S.o_service)) { conds.push(`o.${ident(S.o_service)} = :service`); params.service = String(f.service); }
+  if (f.orderType && has(S.o_orderType)) { conds.push(`o.${ident(S.o_orderType)} = :orderType`); params.orderType = String(f.orderType); }
 
   return {
     where: `WHERE ${conds.join(' AND ')}`,
@@ -553,16 +556,21 @@ export async function facets(clientKey) {
   const S = await resolveSchema();
   const d = oDate(S);
   const ck = clientKeys({ clientKey });
-  const [years, services] = await Promise.all([
+  const [years, services, orderTypes] = await Promise.all([
     query(`SELECT DISTINCT YEAR(${d}) AS y FROM ${ident(S.orders)} WHERE ${ident(S.o_client)} IN (${ck.placeholders}) AND ${d} IS NOT NULL ORDER BY y DESC`, ck.params),
     // No service column means no Service Level dropdown, rather than no dashboard.
     has(S.o_service)
       ? query(`SELECT DISTINCT ${ident(S.o_service)} AS s FROM ${ident(S.orders)} WHERE ${ident(S.o_client)} IN (${ck.placeholders}) AND ${ident(S.o_service)} IS NOT NULL ORDER BY s`, ck.params)
       : Promise.resolve([]),
+    // Same for order type: no column means no Order type dropdown.
+    has(S.o_orderType)
+      ? query(`SELECT DISTINCT ${ident(S.o_orderType)} AS t FROM ${ident(S.orders)} WHERE ${ident(S.o_client)} IN (${ck.placeholders}) AND ${ident(S.o_orderType)} IS NOT NULL ORDER BY t`, ck.params)
+      : Promise.resolve([]),
   ]);
   return {
     years: years.map((r) => Number(r.y)).filter(Boolean),
     serviceLevels: services.map((r) => String(r.s)).filter(Boolean),
+    orderTypes: orderTypes.map((r) => String(r.t)).filter(Boolean),
   };
 }
 
