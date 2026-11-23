@@ -156,6 +156,13 @@ function groupCompanyIds(groups) {
 const idSlug = (id) => String(id || '').split('-')[0];
 
 /**
+ * Is this a full portal company id — '<slug>-<uid>', the uid base36 and at least
+ * ten characters ('abode-mtx3k9q2b1c4ze')? A short handle such as 'roseland' or
+ * 'grass-carpet' is not.
+ */
+const isPortalId = (id) => /^[a-z0-9]{1,24}-[a-z0-9]{10,}$/.test(String(id || ''));
+
+/**
  * Match a token's groups against a CLIENT_MAP entry.
  *
  *   1. EXACT companyId. Correct, and what a properly filled-in map gives you.
@@ -170,6 +177,12 @@ const idSlug = (id) => String(id || '').split('-')[0];
 function matchesGroups(entry, groupIds) {
   if (!groupIds.length) return false;
   if (groupIds.includes(entry.companyId)) return true;
+  // LOCKDOWN (23 Nov 2026). An entry that carries the portal's REAL id matches
+  // that id and nothing else. The name rule below would also hand its figures to
+  // any other company with the same name — a testing copy of the same client,
+  // like the second Roseland — so it only runs for entries still on a short
+  // handle ("roseland", "bedroomking").
+  if (isPortalId(entry.companyId)) return false;
   const wanted = new Set([norm(entry.companyId).slice(0, 24), norm(entry.name).slice(0, 24)]);
   return groupIds.some((g) => wanted.has(idSlug(g)));
 }
