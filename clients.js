@@ -196,8 +196,14 @@ export function resolveCompany(identity, requested = {}) {
     if (!companyId && !companyName) return { staff: true, company: null };
     // Match on the portal's id if it happens to be in the map, otherwise on the
     // company NAME — which is why nobody needs to look up a DynamoDB id.
-    const hit = map.find((c) => c.companyId === String(companyId || ''))
-      || (companyName ? map.find((c) => norm(c.name) === norm(companyName)) : null)
+    // LOCKDOWN (23 Nov 2026): the name never hands over a company that is pinned to
+    // its OWN portal id when the request names a different portal id — a testing
+    // copy of a client, or a second client with the same name, must not show SGK
+    // the first one's figures.
+    const asked = String(companyId || '');
+    const byNameOk = (c) => !(isPortalId(asked) && isPortalId(c.companyId));
+    const hit = map.find((c) => c.companyId === asked)
+      || (companyName ? map.find((c) => norm(c.name) === norm(companyName) && byNameOk(c)) : null)
       || (companyName ? map.find((c) => norm(c.companyId) === norm(companyName)) : null);
     if (!hit) {
       // The message says which company has no key, and nothing else.

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# ADD A COMPANY TO THE DASHBOARDS (or put one right that is already there).
+# ADD COMPANIES TO THE DASHBOARDS (or pin ones that are already there).
 #
 # Run it on the analytics box (sgk-analytics-live), in the browser terminal:
 #
 #     sudo bash /opt/sgk-analytics-api/deploy/add-client.sh
 #
-# It asks three questions, finds the company's client name(s) in the delivery
-# system itself, shows you exactly what it will save, and only writes once you
-# say yes. Then it proves the lockdown — the company's own login sees its
-# dashboard, a second company with the same name does not — and restarts the
-# service. A dated copy of the settings file is kept before anything changes.
+# One company or several in one run: for each, its name and its portal id; it
+# finds the company's client name(s) in the delivery system itself. It shows you
+# exactly what it will save and only writes once you say yes. Then it proves the
+# lockdown — each company's own login sees its dashboard, a second company with
+# the same name does not — and restarts the service once. A dated copy of the
+# settings file is kept before anything changes.
 # ===========================================================================
 set -euo pipefail
 
