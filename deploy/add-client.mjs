@@ -6,8 +6,8 @@
 //
 // One company or several in one run. For each one it asks:
 //   • the name, exactly as the portal shows it;
-//   • the portal id (DynamoDB → Explore items → the Company- table), or the
-//     Cognito group, which is the same id with company_ in front. The id is the
+//   • the portal id (from the CloudShell company list), or the Cognito group,
+//     which is the same id with company_ in front. The id is the
 //     lockdown key: a login sees a company's figures only if it carries that id;
 //   • which client name(s) in the delivery system are that company's — it finds
 //     them itself, and refuses one that another company already owns.
@@ -41,8 +41,11 @@ const stop = (msg) => { say(`\n✖ ${msg}`); process.exit(1); };
 const count = (n) => Number(n || 0).toLocaleString('en-GB');
 
 // A portal company id: the name squashed to 24 letters at most, a dash, then the
-// time it was made (base 36) and a few random letters — abode-mtx3k9q2b1c4ze.
+// time it was made (base 36) and a few random letters — about 14 in all.
 const isPortalId = (id) => /^[a-z0-9]{1,24}-[a-z0-9]{10,}$/.test(String(id || ''));
+// An example that once appeared in the instructions looked like a real id and was
+// pasted as one. It is refused outright; no example shown now looks real.
+const NOT_REAL = new Set(['abode-mtx3k9q2b1c4ze']);
 const keysOf = (c) => (Array.isArray(c?.sqlKey) ? c.sqlKey : [c?.sqlKey])
   .filter((k) => k != null && k !== '').map(String);
 
@@ -139,14 +142,15 @@ function matchPartners(name, partners) {
 // ── one company's portal id ──────────────────────────────────────────────────
 async function askId(ask, name) {
   const slug = slugOf(name);
-  say(`  Its id: DynamoDB → Explore items → the Company- table → ${name} → id. (Its Cognito group works too.)`);
+  say(`  Copy ${name}'s id from the CloudShell list (its Cognito group works too).`);
   for (let tries = 0; tries < 3; tries++) {
     const raw = (await ask(`  Paste ${name}'s id: `)).toLowerCase();
     if (!raw) return '';
     // A paste can carry the terminal's paste markers or "company_" — take just
     // the id out of whatever arrived.
     const m = raw.match(/[a-z0-9]{1,24}-[a-z0-9]{10,}/);
-    if (!m) { say('  That is not a company id (it looks like abode-mtx3k9q2b1c4ze). Try again.'); continue; }
+    if (!m) { say('  That is not a company id. It is the name, a dash, then about 14 letters and numbers. Try again.'); continue; }
+    if (NOT_REAL.has(m[0])) { say('  That is the example from the instructions, not a real id. Copy the real one from CloudShell.'); continue; }
     const id = m[0];
     const madeFor = id.split('-')[0];
     if (madeFor !== slug) {
@@ -277,12 +281,18 @@ async function main() {
     //    short handle — by its name.
     const byId = work.find((c) => c.companyId === id);
     const byName = byId ? null : work.find((c) => norm(c.name) === norm(name) || norm(c.companyId) === norm(name));
+    let movedFrom = '';
     if (byName && isPortalId(byName.companyId)) {
-      // Pinned to ANOTHER id: that is a different company with the same name (a
-      // testing copy, say). The dashboard stays where it is.
-      const when = madeOn(byName.companyId);
-      say(`  "${byName.name}" is already pinned to ${byName.companyId}${when ? ` (made ${when})` : ''}. It stays there. Skipped.`);
-      continue;
+      // Pinned to ANOTHER id. Usually that is a different company with the same
+      // name (a testing copy), and the dashboard must stay where it is. It moves
+      // only when the old id is wrong — and only on a clear yes.
+      if (changes.some((c) => c.entry === byName)) { say(`  ${byName.name} is already set in this run. Skipped.`); continue; }
+      const was = madeOn(byName.companyId);
+      const now = madeOn(id);
+      say(`  ${byName.name}'s dashboard is pinned to ${byName.companyId}${was ? ` (made ${was})` : ''}.`);
+      const mv = (await ask(`  Move it to ${id}${now ? ` (made ${now})` : ''}? Only if the old id is wrong. (y/n): `)).toLowerCase();
+      if (mv !== 'y') { say('  It stays where it is. Skipped.'); continue; }
+      movedFrom = byName.companyId;
     }
     const old = byId || byName || null;
 
@@ -311,7 +321,7 @@ async function main() {
     const same = (c) => JSON.stringify([c.companyId, c.name, keysOf(c), c.domains || [], c.emails || []]);
     if (old && same(old) === same(entry)) { say(`  ✓ ${name} is already set up exactly like that. Nothing to change.`); continue; }
     if (old) work[work.indexOf(old)] = entry; else work.push(entry);
-    changes.push({ old, entry });
+    changes.push({ old, entry, movedFrom });
     say(`  ✓ ${name} is ready to save.`);
   }
 
@@ -319,8 +329,8 @@ async function main() {
 
   // 4. What will be saved.
   say('\n=== WHAT WILL BE SAVED ===');
-  for (const { old, entry } of changes) {
-    say(`\n  ${old ? 'REPLACING' : 'ADDING'}  ${entry.name}`);
+  for (const { old, entry, movedFrom } of changes) {
+    say(`\n  ${movedFrom ? 'MOVING' : old ? 'REPLACING' : 'ADDING'}  ${entry.name}`);
     if (old) say(`    was: ${JSON.stringify(old)}`);
     say(`    now: ${JSON.stringify(entry)}`);
   }
@@ -356,12 +366,14 @@ async function main() {
   // 6. Prove the lockdown with the code that will actually run.
   say('\n=== LOCKDOWN CHECK ===');
   const plan = {
-    changed: changes.map(({ entry }) => ({
+    changed: changes.map(({ entry, movedFrom }) => ({
       id: entry.companyId,
       name: entry.name,
       // A same-name company made later gets the slug of today's name; one made
       // earlier carries the slug that is in this id. Both are tried.
-      twins: [...new Set([slugOf(entry.name), entry.companyId.split('-')[0]])].map((s) => `${s}-zzzzzzzzzzzzzz`),
+      // A dashboard that moved must not answer to its old id any more either.
+      twins: [...new Set([slugOf(entry.name), entry.companyId.split('-')[0]])].map((s) => `${s}-zzzzzzzzzzzzzz`)
+        .concat(movedFrom ? [movedFrom] : []),
     })),
     pinned: work.filter((c) => isPortalId(c.companyId)).map((c) => c.companyId),
   };
