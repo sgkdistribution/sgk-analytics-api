@@ -22,4 +22,4 @@ ENVF=/etc/sgk-analytics.env
 [ -f "$APP/deploy/add-client.mjs" ] || { echo "The code is out of date — update it first (see the top of this file)."; exit 1; }
 
 cd "$APP"
-exec node "$APP/deploy/add-client.mjs"
+exec node "$APP/deploy/add-client.mjs" "$@"
